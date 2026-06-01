@@ -1,0 +1,46 @@
+name: Weekly Memory Spot Price Scrape
+
+on:
+  schedule:
+    # 北京时间每天早上 9:13 (UTC 1:13)
+    - cron: "13 1 * * *"
+  workflow_dispatch:   # 允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: Run scraper
+        run: npm run scrape
+        timeout-minutes: 5
+
+      - name: Commit and push data + docs
+        run: |
+          git config user.name "memory-scraper-bot"
+          git config user.email "bot@memory-scraper.local"
+          git add data/ docs/
+          if git diff --staged --quiet; then
+            echo "No new data to commit"
+          else
+            git commit -m "data: $(date +%Y-%m-%d) daily update"
+            git push
+          fi

@@ -1,0 +1,12 @@
+{
+  "name": "memory-price-scraper",
+  "version": "1.0.0",
+  "description": "DRAM/memory spot price tracker — TrendForce via bomman.com, weekly updates",
+  "type": "module",
+  "scripts": {
+    "scrape": "node scraper.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}
