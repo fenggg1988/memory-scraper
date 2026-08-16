@@ -1,13 +1,10 @@
 {
   "name": "memory-price-scraper",
-  "version": "1.0.0",
-  "description": "DDR4/DDR5 memory price tracker — ZOL retail prices, daily updates",
+  "version": "2.0.0",
+  "description": "DDR4/DDR5 memory price tracker — RamRadar retail prices (USD/GB), daily updates",
   "type": "module",
   "scripts": {
     "scrape": "node scraper.mjs",
     "test": "node --test"
-  },
-  "dependencies": {
-    "playwright": "^1.52.0"
   }
 }

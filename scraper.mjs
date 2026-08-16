@@ -1,22 +1,30 @@
 /**
  * DRAM / Memory Price Tracker
  * ==================================
- * 从 ZOL (中关村在线) 抓取 DDR4/DDR5 内存零售价格
- * 每日统计均价、最低价、最高价、样本数
+ * 数据源：RamRadar RAM Price Index（美国零售价，聚合自 eBay / Newegg / B&H Photo）
+ *   公开 CSV：https://ramradar.app/ram-price-index/data.csv
+ *   单位：美元每 GB（USD/GB），按内存模组（DIMM）规格归一化，可直接跨容量比较
+ *
+ * 相比原来的 ZOL（中关村在线）方案：
+ *   - 数据源位于美国，GitHub Actions 海外服务器可正常访问（ZOL 在国外被墙）
+ *   - 纯 CSV 下载 + 解析，无需 Playwright / 无头浏览器，CI 更快更稳
+ *   - 价格归一化为 $/GB，比「整条模组人民币价」更可比
  *
  * 用法:
  *   npm run scrape
  */
 
-import { chromium } from "playwright";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
+const DOCS_DIR = path.join(__dirname, "docs");
 const TODAY = new Date().toISOString().slice(0, 10);
-const ZOL_MEMORY_URL = "https://detail.zol.com.cn/memory/";
+
+// RamRadar 公开 CSV（无需 API key，海外可访问）
+const RAMRADAR_CSV_URL = "https://ramradar.app/ram-price-index/data.csv";
 
 // ── 工具函数 ──
 
@@ -49,6 +57,10 @@ export async function withRetries(operation, options = {}) {
   }
 
   throw lastError;
+}
+
+function round2(x) {
+  return Math.round((x + Number.EPSILON) * 100) / 100;
 }
 
 export function saveCSV(filename, rows, dataDir = DATA_DIR) {
@@ -86,130 +98,82 @@ export function saveCSV(filename, rows, dataDir = DATA_DIR) {
   };
 }
 
-function avg(arr) {
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
+// ── RamRadar CSV 抓取与解析 ──
 
-// ── ZOL 内存价格抓取 ──
-
-export async function navigateToZOL(page) {
-  const response = await page.goto(ZOL_MEMORY_URL, {
-    waitUntil: "domcontentloaded",
-    timeout: 45_000,
+export async function fetchCsv(url) {
+  const res = await fetch(url, {
+    headers: { "User-Agent": "memory-price-scraper/2.0 (+github actions)" },
   });
-
-  await page.waitForSelector("[class*=price]", { timeout: 15_000 });
-  await page.waitForTimeout(3_000);
-  return response;
-}
-
-async function scrapeZOLOnce(browser) {
-  const page = await browser.newPage();
-  const allProducts = [];
-
-  try {
-    await navigateToZOL(page);
-
-    // ZOL 价格元素的父容器中包含完整产品信息
-    const products = await page.$$eval(
-      "[class*=price]",
-      (els) =>
-        els
-          .filter((el) => el.textContent.includes("参考价"))
-          .map((priceEl) => {
-            // 向上找到产品卡片容器
-            let container = priceEl;
-            for (let i = 0; i < 5; i++) {
-              container = container.parentElement;
-              if (!container) break;
-              const text = container.textContent?.trim() || "";
-              if (text.length > 30 && text.length < 800) break;
-            }
-            const text = (container?.textContent || "")
-              .replace(/\s+/g, " ")
-              .trim();
-            const priceMatch = text.match(/参考价[：:]\s*[¥￥]\s*(\d+)/);
-            return {
-              text,
-              price: priceMatch ? parseInt(priceMatch[1]) : 0,
-            };
-          })
-    );
-
-    for (const p of products) {
-      if (p.price > 0) {
-        const namePart = p.text.split("参考价")[0].trim();
-        allProducts.push({ name: namePart, price: p.price });
-      }
-    }
-  } finally {
-    await page.close().catch(() => {});
+  if (!res.ok) {
+    throw new Error(`Failed to fetch ${url}: HTTP ${res.status}`);
   }
+  return res.text();
+}
 
-  // 去重：按 name+price 组合
-  const seen = new Set();
-  const unique = allProducts.filter((p) => {
-    const key = `${p.name}|${p.price}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-
-  console.log(`  Total unique products: ${unique.length}`);
-
-  // 按 DDR4 / DDR5 分类
-  const ddr4 = unique.filter(
-    (p) => p.name.includes("DDR4") && !p.name.includes("DDR5")
-  );
-  const ddr5 = unique.filter(
-    (p) => p.name.includes("DDR5") && !p.name.includes("DDR4")
-  );
-
-  console.log(
-    `  DDR4: ${ddr4.length} samples, DDR5: ${ddr5.length} samples`
-  );
-
-  // 生成汇总行
-  const results = [];
-
-  for (const [label, items] of [
-    ["DDR4", ddr4],
-    ["DDR5", ddr5],
-  ]) {
-    if (items.length === 0) continue;
-    const prices = items.map((i) => i.price);
-    results.push({
-      date: TODAY,
-      source: "zol",
-      category: label,
-      avg_price_cny: Math.round(avg(prices)),
-      min_price_cny: Math.min(...prices),
-      max_price_cny: Math.max(...prices),
-      sample_count: prices.length,
+export function parseCsv(text) {
+  const lines = text.trim().split("\n");
+  if (lines.length < 2) return [];
+  const header = lines[0].split(",").map((h) => h.trim());
+  return lines.slice(1).map((line) => {
+    const cells = line.split(",");
+    const obj = {};
+    header.forEach((h, i) => {
+      obj[h] = (cells[i] ?? "").trim();
     });
-    console.log(
-      `  ${label}: avg ¥${Math.round(avg(prices))} (${prices.length} samples, range ¥${Math.min(...prices)}-¥${Math.max(...prices)})`
-    );
-  }
-
-  return results;
+    return obj;
+  });
 }
 
-export async function scrapeZOL(browser) {
-  return withRetries(() => scrapeZOLOnce(browser), {
-    attempts: 3,
-    delayMs: 2_000,
-    label: "ZOL scrape",
-  });
+/**
+ * 从 RamRadar 全量 CSV 构建每日 DDR4/DDR5（桌面 DIMM）行。
+ * 每个 (date, ram_type) 取一行，价格单位 USD/GB。
+ */
+export function buildDailyRows(allRows) {
+  const desktop = allRows.filter(
+    (r) =>
+      r.form_factor === "DIMM" &&
+      (r.ram_type === "DDR4" || r.ram_type === "DDR5")
+  );
+
+  const byDate = new Map();
+  for (const r of desktop) {
+    if (!byDate.has(r.date)) byDate.set(r.date, {});
+    const bucket = byDate.get(r.date);
+    bucket[r.ram_type] = {
+      avg: parseFloat(r.avg_price_per_gb),
+      min: parseFloat(r.min_price_per_gb),
+      max: parseFloat(r.max_price_per_gb),
+      count: parseInt(r.product_count, 10) || 0,
+    };
+  }
+
+  const out = [];
+  const dates = [...byDate.keys()].sort();
+  for (const date of dates) {
+    const types = byDate.get(date);
+    for (const cat of ["DDR4", "DDR5"]) {
+      const t = types[cat];
+      if (!t || !isFinite(t.avg)) continue;
+      out.push({
+        date,
+        source: "ramradar",
+        category: cat,
+        avg_price: round2(t.avg),
+        min_price: round2(t.min),
+        max_price: round2(t.max),
+        sample_count: t.count,
+      });
+    }
+  }
+  return out;
 }
 
 // ── JSON + HTML 导出 ──
 
 function exportJSON() {
-  const docsDir = path.join(__dirname, "docs");
-  fs.mkdirSync(docsDir, { recursive: true });
+  fs.mkdirSync(DOCS_DIR, { recursive: true });
 
-  const csvPath = path.join(DATA_DIR, "zol_prices.csv");
+  const csvPath = path.join(DATA_DIR, "ram_prices.csv");
   if (!fs.existsSync(csvPath)) return;
 
   const lines = fs.readFileSync(csvPath, "utf-8").trim().split("\n");
@@ -221,10 +185,8 @@ function exportJSON() {
     const obj = {};
     headers.forEach((h, i) => {
       const v = vals[i];
-      if (
-        ["avg_price_cny", "min_price_cny", "max_price_cny", "sample_count"].includes(h)
-      ) {
-        obj[h] = parseInt(v);
+      if (["avg_price", "min_price", "max_price", "sample_count"].includes(h)) {
+        obj[h] = parseFloat(v);
       } else {
         obj[h] = v;
       }
@@ -233,14 +195,13 @@ function exportJSON() {
   });
 
   // JSON 文件
-  const jsonPath = path.join(docsDir, "zol_prices.json");
+  const jsonPath = path.join(DOCS_DIR, "ram_prices.json");
   fs.writeFileSync(jsonPath, JSON.stringify(json));
   console.log(`  Exported ${json.length} rows → ${jsonPath}`);
 
   // 自包含 HTML（数据直接嵌入，无需 HTTP 服务器）
-  const htmlPath = path.join(docsDir, "index.html");
-  const jsonLiteral = JSON.stringify(json);
-  const html = buildHTML(jsonLiteral);
+  const htmlPath = path.join(DOCS_DIR, "index.html");
+  const html = buildHTML(JSON.stringify(json));
   fs.writeFileSync(htmlPath, html);
   console.log(`  Exported self-contained HTML → ${htmlPath}`);
 }
@@ -251,7 +212,7 @@ function buildHTML(jsonLiteral) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DDR4/DDR5 内存价格追踪</title>
+<title>DDR4/DDR5 内存价格追踪 (USD/GB)</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <style>
   :root { --bg: #f5f6fa; --card: #fff; --text: #2c3e50; --muted: #7f8c8d; }
@@ -278,24 +239,24 @@ function buildHTML(jsonLiteral) {
 <div class="container">
   <header>
     <h1>DDR4 / DDR5 内存价格追踪</h1>
-    <p>数据来源：ZOL 中关村在线 | 每日自动更新 | 价格单位：人民币 (CNY)</p>
+    <p>数据来源：RamRadar（eBay / Newegg / B&H 零售价，归一化为 USD/GB）| 每日自动更新</p>
   </header>
 
   <div class="stats" id="stats"></div>
 
   <div class="card">
-    <h2>价格走势</h2>
+    <h2>价格走势 (USD/GB)</h2>
     <div class="chart" id="trend-chart"></div>
   </div>
 
   <div class="card">
-    <h2>最新价格分布</h2>
+    <h2>最新价格分布 (USD/GB)</h2>
     <div class="chart" id="range-chart"></div>
   </div>
 
   <div class="footer">
     最后更新: <span id="last-update">-</span> &nbsp;|&nbsp;
-    数据仅供参考，不构成投资建议
+    价格单位：美元每 GB (USD/GB) &nbsp;|&nbsp; 数据仅供参考，不构成投资建议
   </div>
 </div>
 
@@ -315,9 +276,9 @@ if (DATA.length === 0) {
   const ddr5 = latestDay.find(r => r.category === "DDR5");
 
   document.getElementById("stats").innerHTML = [
-    ddr5 ? '<div class="stat ddr5"><div class="val">¥' + ddr5.avg_price_cny + '</div><div class="lbl">DDR5 均价 (' + ddr5.sample_count + ' 样本)</div></div>' : "",
-    ddr4 ? '<div class="stat ddr4"><div class="val">¥' + ddr4.avg_price_cny + '</div><div class="lbl">DDR4 均价 (' + ddr4.sample_count + ' 样本)</div></div>' : "",
-    ddr5 ? '<div class="stat"><div class="val">¥' + ddr5.min_price_cny + ' - ¥' + ddr5.max_price_cny + '</div><div class="lbl">DDR5 价格区间</div></div>' : "",
+    ddr5 ? '<div class="stat ddr5"><div class="val">$' + ddr5.avg_price.toFixed(2) + '/GB</div><div class="lbl">DDR5 均价 (' + ddr5.sample_count + ' 样本)</div></div>' : "",
+    ddr4 ? '<div class="stat ddr4"><div class="val">$' + ddr4.avg_price.toFixed(2) + '/GB</div><div class="lbl">DDR4 均价 (' + ddr4.sample_count + ' 样本)</div></div>' : "",
+    ddr5 ? '<div class="stat"><div class="val">$' + ddr5.min_price.toFixed(2) + ' - $' + ddr5.max_price.toFixed(2) + '</div><div class="lbl">DDR5 价格区间</div></div>' : "",
     '<div class="stat"><div class="val">' + (DATA.length / 2) + '</div><div class="lbl">累计数据天数</div></div>',
   ].join("");
 
@@ -325,20 +286,20 @@ if (DATA.length === 0) {
   const dates = [...new Set(DATA.map(r => r.date))].sort();
   const ddr4Series = dates.map(d => {
     const r = DATA.find(x => x.date === d && x.category === "DDR4");
-    return r ? r.avg_price_cny : null;
+    return r ? r.avg_price : null;
   });
   const ddr5Series = dates.map(d => {
     const r = DATA.find(x => x.date === d && x.category === "DDR5");
-    return r ? r.avg_price_cny : null;
+    return r ? r.avg_price : null;
   });
 
   const trendChart = echarts.init(document.getElementById("trend-chart"));
   trendChart.setOption({
-    tooltip: { trigger: "axis", valueFormatter: v => "¥" + v },
+    tooltip: { trigger: "axis", valueFormatter: v => "$" + v + "/GB" },
     legend: { data: ["DDR4 均价", "DDR5 均价"], bottom: 0 },
     grid: { left: 60, right: 20, top: 10, bottom: 30 },
     xAxis: { type: "category", data: dates },
-    yAxis: { type: "value", name: "CNY", axisLabel: { formatter: "¥{value}" } },
+    yAxis: { type: "value", name: "USD/GB", axisLabel: { formatter: (v) => "$" + v } },
     series: [
       { name: "DDR4 均价", type: "line", data: ddr4Series, smooth: true, symbol: "circle", symbolSize: 6,
         lineStyle: { color: "#3498db", width: 2 }, itemStyle: { color: "#3498db" } },
@@ -351,24 +312,24 @@ if (DATA.length === 0) {
   const categories = ["DDR4", "DDR5"];
   const minData = categories.map(c => {
     const r = latestDay.find(x => x.category === c);
-    return r ? r.min_price_cny : 0;
+    return r ? r.min_price : 0;
   });
   const avgData = categories.map(c => {
     const r = latestDay.find(x => x.category === c);
-    return r ? r.avg_price_cny : 0;
+    return r ? r.avg_price : 0;
   });
   const maxData = categories.map(c => {
     const r = latestDay.find(x => x.category === c);
-    return r ? r.max_price_cny : 0;
+    return r ? r.max_price : 0;
   });
 
   const rangeChart = echarts.init(document.getElementById("range-chart"));
   rangeChart.setOption({
-    tooltip: { trigger: "axis", valueFormatter: v => "¥" + v },
+    tooltip: { trigger: "axis", valueFormatter: v => "$" + v + "/GB" },
     legend: { data: ["最低价", "均价", "最高价"], bottom: 0 },
     grid: { left: 60, right: 20, top: 10, bottom: 30 },
     xAxis: { type: "category", data: categories },
-    yAxis: { type: "value", name: "CNY", axisLabel: { formatter: "¥{value}" } },
+    yAxis: { type: "value", name: "USD/GB", axisLabel: { formatter: (v) => "$" + v } },
     series: [
       { name: "最低价", type: "bar", data: minData, itemStyle: { color: "#27ae60" } },
       { name: "均价", type: "bar", data: avgData, itemStyle: { color: "#3498db" } },
@@ -384,37 +345,44 @@ if (DATA.length === 0) {
 // ── 主流程 ──
 
 export async function main() {
-  console.log(
-    `[${new Date().toISOString()}] Memory price scraper — ZOL`
-  );
+  console.log(`[${new Date().toISOString()}] Memory price scraper — RamRadar`);
 
-  const browser = await chromium.launch({ headless: true });
+  console.log("\n── Downloading RamRadar CSV ──");
+  const csv = await withRetries(() => fetchCsv(RAMRADAR_CSV_URL), {
+    attempts: 3,
+    delayMs: 2_000,
+    label: "RamRadar CSV fetch",
+  });
 
-  try {
-    console.log("\n── ZOL (中关村在线 DDR4/DDR5 零售价) ──");
-    const rows = await scrapeZOL(browser);
+  const allRows = parseCsv(csv);
+  console.log(`  Parsed ${allRows.length} raw rows from RamRadar`);
 
-    if (rows.length > 0) {
-      const saved = saveCSV("zol_prices.csv", rows);
-      if (saved.addedRows > 0) {
-        console.log(`  Saved ${saved.addedRows} new rows → ${saved.filePath}`);
-      } else {
-        console.log(`  No new CSV rows written → ${saved.filePath}`);
-      }
+  const daily = buildDailyRows(allRows);
+  console.log(`  Built ${daily.length} daily DDR4/DDR5 (DIMM) rows`);
+
+  if (daily.length > 0) {
+    const saved = saveCSV("ram_prices.csv", daily);
+    if (saved.addedRows > 0) {
+      console.log(
+        `  Saved ${saved.addedRows} new rows → ${saved.filePath} (skipped ${saved.skippedRows})`
+      );
     } else {
-      console.log("  No data extracted");
+      console.log(`  No new CSV rows written → ${saved.filePath}`);
     }
-
-    console.log("\n── export JSON ──");
-    exportJSON();
-  } finally {
-    await browser.close();
+  } else {
+    console.log("  No data extracted");
   }
+
+  console.log("\n── export JSON + HTML ──");
+  exportJSON();
 
   console.log("\nDone.");
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
   main().catch((err) => {
     console.error("Fatal:", err);
     process.exit(1);
