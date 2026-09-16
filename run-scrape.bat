@@ -3,7 +3,7 @@ REM Daily memory price scraper — RamRadar source (USD/GB)
 REM Runs scraper.mjs which downloads the public RamRadar CSV.
 setlocal
 set "PROJECT_DIR=C:\Users\fengz\memory-scraper"
-set "NODE_EXE=C:\Users\fengz\AppData\Local\Programs\Node\node.exe"
+set "NODE_EXE=C:\Program Files\nodejs\node.exe"
 set "LOG_FILE=%PROJECT_DIR%\scrape.log"
 
 cd /d "%PROJECT_DIR%"
