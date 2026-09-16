@@ -26,6 +26,9 @@ const TODAY = new Date().toISOString().slice(0, 10);
 // RamRadar 公开 CSV（无需 API key，海外可访问）
 const RAMRADAR_CSV_URL = "https://ramradar.app/ram-price-index/data.csv";
 
+// memoryindex.io — HBM / DDR5 现货与合约价聚合（含 HBM3 / HBM3E / HBM4 每 stack 价格）
+const MEMORYINDEX_URL = "https://memoryindex.io/zh";
+
 // ── 工具函数 ──
 
 function sleep(ms) {
@@ -170,6 +173,114 @@ export function buildDailyRows(allRows) {
 
 // ── JSON + HTML 导出 ──
 
+// ── HBM 价格（memoryindex.io 聚合，TrendForce / Silicon Analysts 口径）──
+//
+// 页面以 <span class="text-muted-foreground">HBM3E-36G</span>
+//        <span class="text-foreground">$299.93</span>
+//        <span class="text-down">-0.10%</span> 的形式列出各品种。
+// 我们抓 HBM* 品种，并按其标称容量换算 $/GB。
+
+export function parseMemoryIndex(html) {
+  const re =
+    /text-muted-foreground">([A-Za-z0-9\-]{2,20})<\/span><span class="text-foreground">\$([0-9][0-9,]*\.?[0-9]*)<\/span><span class="text-(up|down)">([+-][0-9.]+)%/g;
+  const out = [];
+  const seen = new Set();
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const [, item, priceStr, dir, pct] = m;
+    if (seen.has(item)) continue;
+    seen.add(item);
+    const price = parseFloat(priceStr.replace(/,/g, ""));
+    if (!isFinite(price)) continue;
+    const capMatch = item.match(/-(\d+)G$/);
+    const capacity = capMatch ? parseInt(capMatch[1], 10) : null;
+    out.push({
+      item,
+      price_usd: price,
+      capacity_gb: capacity,
+      price_per_gb: capacity ? round2(price / capacity) : null,
+      change_pct: (dir === "down" ? -1 : 1) * parseFloat(pct),
+    });
+  }
+  return out;
+}
+
+export async function fetchHbm() {
+  const res = await fetch(MEMORYINDEX_URL, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 memory-price-scraper/2.1",
+    },
+  });
+  if (!res.ok) throw new Error(`Failed to fetch ${MEMORYINDEX_URL}: HTTP ${res.status}`);
+  const html = await res.text();
+  return parseMemoryIndex(html).filter((r) => r.item.startsWith("HBM"));
+}
+
+const HBM_CSV = "hbm_prices.csv";
+
+function saveHbmCSV(rows, dataDir = DATA_DIR) {
+  const fp = path.join(dataDir, HBM_CSV);
+  fs.mkdirSync(dataDir, { recursive: true });
+  if (rows.length === 0) return { filePath: fp, addedRows: 0 };
+
+  if (!fs.existsSync(fp)) {
+    fs.writeFileSync(
+      fp,
+      "date,source,item,capacity_gb,price_usd,price_per_gb,change_pct\n"
+    );
+  }
+  const seen = new Set(
+    fs
+      .readFileSync(fp, "utf-8")
+      .trim()
+      .split("\n")
+      .slice(1)
+      .filter(Boolean)
+      .map((l) => l.split(",").slice(0, 3).join(","))
+  );
+  const fresh = rows.filter((r) => !seen.has(`${r.date},${r.source},${r.item}`));
+  if (fresh.length === 0) return { filePath: fp, addedRows: 0 };
+
+  const lines = fresh
+    .map((r) =>
+      [
+        r.date,
+        r.source,
+        r.item,
+        r.capacity_gb ?? "",
+        r.price_usd,
+        r.price_per_gb ?? "",
+        r.change_pct,
+      ].join(",")
+    )
+    .join("\n");
+  fs.appendFileSync(fp, lines + "\n");
+  return { filePath: fp, addedRows: fresh.length };
+}
+
+function loadHbmRows() {
+  const fp = path.join(DATA_DIR, HBM_CSV);
+  if (!fs.existsSync(fp)) return [];
+  const lines = fs.readFileSync(fp, "utf-8").trim().split("\n");
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",");
+  return lines.slice(1).filter(Boolean).map((line) => {
+    const vals = line.split(",");
+    const obj = {};
+    headers.forEach((h, i) => {
+      const v = vals[i];
+      obj[h] =
+        h === "date" || h === "source" || h === "item"
+          ? v
+          : v === ""
+            ? null
+            : parseFloat(v);
+    });
+    return obj;
+  });
+}
+
 function exportJSON() {
   fs.mkdirSync(DOCS_DIR, { recursive: true });
 
@@ -200,19 +311,27 @@ function exportJSON() {
   console.log(`  Exported ${json.length} rows → ${jsonPath}`);
 
   // 自包含 HTML（数据直接嵌入，无需 HTTP 服务器）
+  const hbmRows = loadHbmRows();
+  const hbmPath = path.join(DOCS_DIR, "hbm_prices.json");
+  fs.writeFileSync(hbmPath, JSON.stringify(hbmRows));
+  console.log(`  Exported ${hbmRows.length} HBM rows → ${hbmPath}`);
+
   const htmlPath = path.join(DOCS_DIR, "index.html");
-  const html = buildHTML(JSON.stringify(json));
+  const html = buildHTML(JSON.stringify(json), JSON.stringify(hbmRows));
   fs.writeFileSync(htmlPath, html);
   console.log(`  Exported self-contained HTML → ${htmlPath}`);
 }
 
-function buildHTML(jsonLiteral) {
+function buildHTML(jsonLiteral, hbmLiteral = "[]") {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DDR4/DDR5 内存价格追踪 (USD/GB)</title>
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>DDR4/DDR5/HBM 内存价格追踪</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <style>
   :root { --bg: #f5f6fa; --card: #fff; --text: #2c3e50; --muted: #7f8c8d; }
@@ -238,11 +357,22 @@ function buildHTML(jsonLiteral) {
 <body>
 <div class="container">
   <header>
-    <h1>DDR4 / DDR5 内存价格追踪</h1>
-    <p>数据来源：RamRadar（eBay / Newegg / B&H 零售价，归一化为 USD/GB）| 每日自动更新</p>
+    <h1>DDR4 / DDR5 / HBM 内存价格追踪</h1>
+    <p>数据来源：RamRadar（零售价，USD/GB）+ memoryindex.io（HBM 现货/合约价聚合）| 每日自动更新</p>
   </header>
 
   <div class="stats" id="stats"></div>
+
+  <div class="card">
+    <h2>HBM 价格（USD / stack）</h2>
+    <div class="stats" id="hbm-stats"></div>
+    <div class="chart" id="hbm-bar" style="height:320px"></div>
+  </div>
+
+  <div class="card">
+    <h2>HBM 每 GB 价格走势 (USD/GB)</h2>
+    <div class="chart" id="hbm-trend" style="height:320px"></div>
+  </div>
 
   <div class="card">
     <h2>价格走势 (USD/GB)</h2>
@@ -262,14 +392,76 @@ function buildHTML(jsonLiteral) {
 
 <script>
 const DATA = ${jsonLiteral};
+const HBM_DATA = ${hbmLiteral};
+
+// 页面显示的最后更新日期 = 两个数据集里最新的日期
+const LAST_UPDATE_DATE = [...new Set([...DATA.map(r => r.date), ...HBM_DATA.map(r => r.date)])].sort().pop() || "-";
+document.getElementById("last-update").textContent = LAST_UPDATE_DATE;
+
+function renderHbm() {
+  const el = document.getElementById("hbm-stats");
+  if (!HBM_DATA.length) {
+    el.innerHTML = '<div class="stat"><div class="val">-</div><div class="lbl">等待首次 HBM 抓取</div></div>';
+    return;
+  }
+  const hbmDates = [...new Set(HBM_DATA.map(r => r.date))].sort();
+  const latestHbmDate = hbmDates[hbmDates.length - 1];
+  const latestHbm = HBM_DATA.filter(r => r.date === latestHbmDate);
+
+  el.innerHTML = latestHbm.map(r => {
+    const dir = r.change_pct > 0 ? "up" : (r.change_pct < 0 ? "down" : "");
+    const arrow = r.change_pct > 0 ? "▲" : (r.change_pct < 0 ? "▼" : "—");
+    const color = r.change_pct > 0 ? "#e74c3c" : (r.change_pct < 0 ? "#27ae60" : "#7f8c8d");
+    const perGb = r.price_per_gb ? (" · $" + r.price_per_gb.toFixed(2) + "/GB") : "";
+    return '<div class="stat"><div class="val">$' + r.price_usd.toFixed(2) + '</div>' +
+      '<div class="lbl">' + r.item + perGb +
+      ' <span style="color:' + color + '">' + arrow + Math.abs(r.change_pct).toFixed(2) + '%</span></div></div>';
+  }).join("");
+
+  // 每 GB 价格走势
+  const items = [...new Set(HBM_DATA.map(r => r.item))].sort();
+  const palette = { "HBM3-24G": "#3498db", "HBM3E-36G": "#9b59b6", "HBM4-48G": "#e67e22" };
+  const hbmTrend = echarts.init(document.getElementById("hbm-trend"));
+  hbmTrend.setOption({
+    tooltip: { trigger: "axis", valueFormatter: v => v == null ? "-" : "$" + v + "/GB" },
+    legend: { data: items, bottom: 0 },
+    grid: { left: 60, right: 20, top: 10, bottom: 30 },
+    xAxis: { type: "category", data: hbmDates },
+    yAxis: { type: "value", name: "USD/GB", axisLabel: { formatter: v => "$" + v } },
+    series: items.map((it, i) => ({
+      name: it, type: "line", smooth: true,
+      symbol: "circle", symbolSize: hbmDates.length === 1 ? 8 : 6,
+      data: hbmDates.map(d => {
+        const r = HBM_DATA.find(x => x.date === d && x.item === it);
+        return r ? r.price_per_gb : null;
+      }),
+      lineStyle: { color: palette[it] || ["#3498db","#9b59b6","#e67e22","#1abc9c"][i % 4], width: 2 },
+      itemStyle: { color: palette[it] || ["#3498db","#9b59b6","#e67e22","#1abc9c"][i % 4] },
+    })),
+  });
+
+  // 当日各品种每 stack 价格
+  const hbmBar = echarts.init(document.getElementById("hbm-bar"));
+  hbmBar.setOption({
+    tooltip: { trigger: "axis" },
+    grid: { left: 70, right: 20, top: 10, bottom: 30 },
+    xAxis: { type: "category", data: latestHbm.map(r => r.item) },
+    yAxis: { type: "value", name: "USD/stack", axisLabel: { formatter: v => "$" + v } },
+    series: [{
+      type: "bar", barWidth: "45%",
+      data: latestHbm.map(r => ({
+        value: r.price_usd,
+        itemStyle: { color: palette[r.item] || "#3498db" },
+      })),
+      label: { show: true, position: "top", formatter: p => "$" + p.value.toFixed(0) },
+    }],
+  });
+}
 
 if (DATA.length === 0) {
   document.getElementById("stats").innerHTML =
     '<div class="stat"><div class="val">-</div><div class="lbl">等待首次数据抓取</div></div>';
 } else {
-  document.getElementById("last-update").textContent =
-    DATA[DATA.length - 1].date;
-
   const latestDate = DATA[DATA.length - 1].date;
   const latestDay = DATA.filter(r => r.date === latestDate);
   const ddr4 = latestDay.find(r => r.category === "DDR4");
@@ -337,6 +529,8 @@ if (DATA.length === 0) {
     ],
   });
 }
+
+renderHbm();
 </script>
 </body>
 </html>`;
@@ -371,6 +565,31 @@ export async function main() {
     }
   } else {
     console.log("  No data extracted");
+  }
+
+  console.log("\n── HBM prices (memoryindex.io) ──");
+  try {
+    const hbm = await withRetries(() => fetchHbm(), {
+      attempts: 3,
+      delayMs: 2_000,
+      label: "memoryindex fetch",
+    });
+    if (hbm.length > 0) {
+      const rows = hbm.map((r) => ({ date: TODAY, source: "memoryindex", ...r }));
+      const savedHbm = saveHbmCSV(rows);
+      console.log(
+        `  HBM items: ${hbm.map((r) => r.item + " $" + r.price_usd + " ($" + r.price_per_gb + "/GB)").join(", ")}`
+      );
+      console.log(
+        savedHbm.addedRows > 0
+          ? `  Saved ${savedHbm.addedRows} new HBM rows → ${savedHbm.filePath}`
+          : `  No new HBM rows → ${savedHbm.filePath}`
+      );
+    } else {
+      console.log("  No HBM items parsed");
+    }
+  } catch (e) {
+    console.warn(`  HBM fetch failed (non-fatal): ${e.message}`);
   }
 
   console.log("\n── export JSON + HTML ──");
