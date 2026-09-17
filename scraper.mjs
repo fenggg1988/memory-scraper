@@ -192,6 +192,9 @@ export function parseMemoryIndex(html) {
     seen.add(item);
     const price = parseFloat(priceStr.replace(/,/g, ""));
     if (!isFinite(price)) continue;
+    // 注意：页面里涨跌幅文本自带符号（如 text-down">-0.04%"），
+    // 所以这里直接取数值即可，不能再按 up/down 乘 ±1（否则负号会被double-negate成上涨）。
+    const pctVal = parseFloat(pct);
     const capMatch = item.match(/-(\d+)G$/);
     const capacity = capMatch ? parseInt(capMatch[1], 10) : null;
     out.push({
@@ -199,7 +202,8 @@ export function parseMemoryIndex(html) {
       price_usd: price,
       capacity_gb: capacity,
       price_per_gb: capacity ? round2(price / capacity) : null,
-      change_pct: (dir === "down" ? -1 : 1) * parseFloat(pct),
+      change_pct: isFinite(pctVal) ? pctVal : 0,
+      change_dir: dir === "down" ? "down" : "up",
     });
   }
   return out;
@@ -349,6 +353,7 @@ function buildHTML(jsonLiteral, hbmLiteral = "[]") {
   .stat .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .card { background: var(--card); border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.06); padding: 24px; margin-bottom: 20px; }
   .card h2 { font-size: 16px; margin-bottom: 16px; }
+  .note { font-size: 12px; color: var(--muted); margin: -8px 0 12px; }
   .chart { width: 100%; height: 360px; }
   .footer { text-align: center; padding: 20px; color: var(--muted); font-size: 12px; }
   @media (max-width: 768px) { .stats { flex-direction: column; } }
@@ -366,17 +371,23 @@ function buildHTML(jsonLiteral, hbmLiteral = "[]") {
   <div class="card">
     <h2>HBM 价格（USD / stack）</h2>
     <div class="stats" id="hbm-stats"></div>
+    <p class="note" id="hbm-note"></p>
     <div class="chart" id="hbm-bar" style="height:320px"></div>
   </div>
 
   <div class="card">
-    <h2>HBM 每 GB 价格走势 (USD/GB)</h2>
-    <div class="chart" id="hbm-trend" style="height:320px"></div>
+    <h2>HBM 每 stack 价格走势 (USD/stack)</h2>
+    <div class="chart" id="hbm-stack-trend" style="height:340px"></div>
   </div>
 
   <div class="card">
-    <h2>价格走势 (USD/GB)</h2>
-    <div class="chart" id="trend-chart"></div>
+    <h2>HBM 每 GB 价格走势 (USD/GB)</h2>
+    <div class="chart" id="hbm-trend" style="height:340px"></div>
+  </div>
+
+  <div class="card">
+    <h2>DDR 与 HBM 价格走势对比 (USD/GB)</h2>
+    <div class="chart" id="trend-chart" style="height:400px"></div>
   </div>
 
   <div class="card">
@@ -398,47 +409,98 @@ const HBM_DATA = ${hbmLiteral};
 const LAST_UPDATE_DATE = [...new Set([...DATA.map(r => r.date), ...HBM_DATA.map(r => r.date)])].sort().pop() || "-";
 document.getElementById("last-update").textContent = LAST_UPDATE_DATE;
 
+const HBM_PALETTE = { "HBM3-24G": "#3498db", "HBM3E-36G": "#9b59b6", "HBM4-48G": "#e67e22" };
+const HBM_FALLBACK = ["#3498db", "#9b59b6", "#e67e22", "#1abc9c", "#f1c40f"];
+const hbmColor = (it, i) => HBM_PALETTE[it] || HBM_FALLBACK[i % HBM_FALLBACK.length];
+const HBM_ITEMS = [...new Set(HBM_DATA.map(r => r.item))].sort();
+const HBM_DATES = [...new Set(HBM_DATA.map(r => r.date))].sort();
+
+// 日环比：用本看板自己累积的价格序列计算（不依赖来源的 24h 涨跌幅，避免口径/符号问题）
+function hbmDayChange(item) {
+  const rows = HBM_DATES.map(d => HBM_DATA.find(x => x.date === d && x.item === item)).filter(Boolean);
+  if (rows.length < 2) return null;
+  const cur = rows[rows.length - 1], prev = rows[rows.length - 2];
+  if (!prev.price_usd) return null;
+  return (cur.price_usd - prev.price_usd) / prev.price_usd * 100;
+}
+
+// 红涨绿跌（A股/国内口径）
+const upDownColor = v => v > 0 ? "#e74c3c" : (v < 0 ? "#27ae60" : "#7f8c8d");
+const upDownArrow = v => v > 0 ? "▲" : (v < 0 ? "▼" : "—");
+
+// 通用折线趋势图配置（与 DDR 走势图同款样式）
+function hbmLineOption(metric, axisName, unitSuffix, dateLabel) {
+  const series = HBM_ITEMS.map((it, i) => ({
+    name: it, type: "line", smooth: true, connectNulls: false,
+    symbol: "circle", symbolSize: HBM_DATES.length <= 3 ? 8 : 5,
+    data: HBM_DATES.map(d => {
+      const r = HBM_DATA.find(x => x.date === d && x.item === it);
+      return r ? r[metric] : null;
+    }),
+    lineStyle: { color: hbmColor(it, i), width: 2 },
+    itemStyle: { color: hbmColor(it, i) },
+    emphasis: { focus: "series" },
+  }));
+  const needZoom = HBM_DATES.length > 40;
+  return {
+    tooltip: {
+      trigger: "axis",
+      valueFormatter: v => v == null ? "-" : "$" + Number(v).toFixed(2) + unitSuffix,
+    },
+    legend: { data: HBM_ITEMS, bottom: 0 },
+    grid: { left: 66, right: 24, top: 16, bottom: needZoom ? 58 : 34 },
+    xAxis: {
+      type: "category", data: HBM_DATES, boundaryGap: false,
+      axisLabel: { hideOverlap: true },
+    },
+    yAxis: {
+      type: "value", name: axisName, scale: true,
+      axisLabel: { formatter: v => "$" + v },
+    },
+    dataZoom: needZoom
+      ? [{ type: "inside" }, { type: "slider", height: 18, bottom: 24 }]
+      : undefined,
+    series,
+    graphic: HBM_DATES.length === 1
+      ? [{ type: "text", left: "center", top: 40,
+           style: { text: "已有 1 天数据，明日起将连成趋势线", fill: "#7f8c8d", fontSize: 12 } }]
+      : undefined,
+  };
+}
+
 function renderHbm() {
   const el = document.getElementById("hbm-stats");
   if (!HBM_DATA.length) {
     el.innerHTML = '<div class="stat"><div class="val">-</div><div class="lbl">等待首次 HBM 抓取</div></div>';
     return;
   }
-  const hbmDates = [...new Set(HBM_DATA.map(r => r.date))].sort();
-  const latestHbmDate = hbmDates[hbmDates.length - 1];
+  const latestHbmDate = HBM_DATES[HBM_DATES.length - 1];
   const latestHbm = HBM_DATA.filter(r => r.date === latestHbmDate);
 
   el.innerHTML = latestHbm.map(r => {
-    const dir = r.change_pct > 0 ? "up" : (r.change_pct < 0 ? "down" : "");
-    const arrow = r.change_pct > 0 ? "▲" : (r.change_pct < 0 ? "▼" : "—");
-    const color = r.change_pct > 0 ? "#e74c3c" : (r.change_pct < 0 ? "#27ae60" : "#7f8c8d");
+    const dod = hbmDayChange(r.item);
+    const chg = dod == null
+      ? '<span style="color:#7f8c8d">— 日环比待累积</span>'
+      : '<span style="color:' + upDownColor(dod) + '">' + upDownArrow(dod) + Math.abs(dod).toFixed(2) + '% 日环比</span>';
     const perGb = r.price_per_gb ? (" · $" + r.price_per_gb.toFixed(2) + "/GB") : "";
     return '<div class="stat"><div class="val">$' + r.price_usd.toFixed(2) + '</div>' +
-      '<div class="lbl">' + r.item + perGb +
-      ' <span style="color:' + color + '">' + arrow + Math.abs(r.change_pct).toFixed(2) + '%</span></div></div>';
+      '<div class="lbl">' + r.item + perGb + '<br>' + chg + '</div></div>';
   }).join("");
 
-  // 每 GB 价格走势
-  const items = [...new Set(HBM_DATA.map(r => r.item))].sort();
-  const palette = { "HBM3-24G": "#3498db", "HBM3E-36G": "#9b59b6", "HBM4-48G": "#e67e22" };
-  const hbmTrend = echarts.init(document.getElementById("hbm-trend"));
-  hbmTrend.setOption({
-    tooltip: { trigger: "axis", valueFormatter: v => v == null ? "-" : "$" + v + "/GB" },
-    legend: { data: items, bottom: 0 },
-    grid: { left: 60, right: 20, top: 10, bottom: 30 },
-    xAxis: { type: "category", data: hbmDates },
-    yAxis: { type: "value", name: "USD/GB", axisLabel: { formatter: v => "$" + v } },
-    series: items.map((it, i) => ({
-      name: it, type: "line", smooth: true,
-      symbol: "circle", symbolSize: hbmDates.length === 1 ? 8 : 6,
-      data: hbmDates.map(d => {
-        const r = HBM_DATA.find(x => x.date === d && x.item === it);
-        return r ? r.price_per_gb : null;
-      }),
-      lineStyle: { color: palette[it] || ["#3498db","#9b59b6","#e67e22","#1abc9c"][i % 4], width: 2 },
-      itemStyle: { color: palette[it] || ["#3498db","#9b59b6","#e67e22","#1abc9c"][i % 4] },
-    })),
-  });
+  const note = document.getElementById("hbm-note");
+  if (note) {
+    note.textContent = "最新日期 " + latestHbmDate + "，已累积 " + HBM_DATES.length + " 天（自 " +
+      HBM_DATES[0] + " 起）· 数据源 memoryindex.io（TrendForce / Silicon Analysts 口径），" +
+      "上游无免费历史接口，趋势由本看板每日采集累积 · 涨跌幅为日环比（红涨绿跌）";
+  }
+
+  // 每 stack 价格走势（折线，每日累积）
+  echarts.init(document.getElementById("hbm-stack-trend"))
+    .setOption(hbmLineOption("price_usd", "USD/stack", "/stack", "每 stack"));
+
+  // 每 GB 价格走势（折线，每日累积）
+  echarts.init(document.getElementById("hbm-trend"))
+    .setOption(hbmLineOption("price_per_gb", "USD/GB", "/GB", "每 GB"));
 
   // 当日各品种每 stack 价格
   const hbmBar = echarts.init(document.getElementById("hbm-bar"));
@@ -449,9 +511,9 @@ function renderHbm() {
     yAxis: { type: "value", name: "USD/stack", axisLabel: { formatter: v => "$" + v } },
     series: [{
       type: "bar", barWidth: "45%",
-      data: latestHbm.map(r => ({
+      data: latestHbm.map((r, i) => ({
         value: r.price_usd,
-        itemStyle: { color: palette[r.item] || "#3498db" },
+        itemStyle: { color: hbmColor(r.item, i) },
       })),
       label: { show: true, position: "top", formatter: p => "$" + p.value.toFixed(0) },
     }],
@@ -474,8 +536,8 @@ if (DATA.length === 0) {
     '<div class="stat"><div class="val">' + (DATA.length / 2) + '</div><div class="lbl">累计数据天数</div></div>',
   ].join("");
 
-  // 价格走势
-  const dates = [...new Set(DATA.map(r => r.date))].sort();
+  // 价格走势对比：DDR4 / DDR5 均价 + HBM 各品种每 GB 价格
+  const dates = [...new Set([...DATA.map(r => r.date), ...HBM_DATES])].sort();
   const ddr4Series = dates.map(d => {
     const r = DATA.find(x => x.date === d && x.category === "DDR4");
     return r ? r.avg_price : null;
@@ -484,19 +546,31 @@ if (DATA.length === 0) {
     const r = DATA.find(x => x.date === d && x.category === "DDR5");
     return r ? r.avg_price : null;
   });
+  const hbmOverlaySeries = HBM_ITEMS.map((it, i) => ({
+    name: it, type: "line", smooth: true, connectNulls: false,
+    symbol: "circle", symbolSize: 5,
+    data: dates.map(d => {
+      const r = HBM_DATA.find(x => x.date === d && x.item === it);
+      return r ? r.price_per_gb : null;
+    }),
+    lineStyle: { color: hbmColor(it, i), width: 2, type: "dashed" },
+    itemStyle: { color: hbmColor(it, i) },
+    emphasis: { focus: "series" },
+  }));
 
   const trendChart = echarts.init(document.getElementById("trend-chart"));
   trendChart.setOption({
-    tooltip: { trigger: "axis", valueFormatter: v => "$" + v + "/GB" },
-    legend: { data: ["DDR4 均价", "DDR5 均价"], bottom: 0 },
-    grid: { left: 60, right: 20, top: 10, bottom: 30 },
-    xAxis: { type: "category", data: dates },
-    yAxis: { type: "value", name: "USD/GB", axisLabel: { formatter: (v) => "$" + v } },
+    tooltip: { trigger: "axis", valueFormatter: v => v == null ? "-" : "$" + Number(v).toFixed(2) + "/GB" },
+    legend: { data: ["DDR4 均价", "DDR5 均价", ...HBM_ITEMS], bottom: 0 },
+    grid: { left: 60, right: 24, top: 16, bottom: 34 },
+    xAxis: { type: "category", data: dates, boundaryGap: false, axisLabel: { hideOverlap: true } },
+    yAxis: { type: "value", name: "USD/GB", scale: true, axisLabel: { formatter: (v) => "$" + v } },
     series: [
-      { name: "DDR4 均价", type: "line", data: ddr4Series, smooth: true, symbol: "circle", symbolSize: 6,
-        lineStyle: { color: "#3498db", width: 2 }, itemStyle: { color: "#3498db" } },
-      { name: "DDR5 均价", type: "line", data: ddr5Series, smooth: true, symbol: "circle", symbolSize: 6,
-        lineStyle: { color: "#e74c3c", width: 2 }, itemStyle: { color: "#e74c3c" } },
+      { name: "DDR4 均价", type: "line", data: ddr4Series, smooth: true, symbol: "circle", symbolSize: 5,
+        lineStyle: { color: "#3498db", width: 2 }, itemStyle: { color: "#3498db" }, emphasis: { focus: "series" } },
+      { name: "DDR5 均价", type: "line", data: ddr5Series, smooth: true, symbol: "circle", symbolSize: 5,
+        lineStyle: { color: "#e74c3c", width: 2 }, itemStyle: { color: "#e74c3c" }, emphasis: { focus: "series" } },
+      ...hbmOverlaySeries,
     ],
   });
 
