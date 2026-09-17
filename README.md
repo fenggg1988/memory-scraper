@@ -26,6 +26,20 @@
 | 接口 | `https://memoryindex.io/zh` 页面内嵌报价（HTML 解析） |
 | 口径 | HBM3-24G / HBM3E-36G / HBM4-48G 每 stack 美元价 + 隐含 USD/GB + 日涨跌 |
 | 更新 | 跟随站点更新节奏；本仓库每次运行时同步抓取 |
+| 历史 | 上游的 5 年历史序列属付费 API（<https://memoryindex.io/api-plans>），免费页面只给当日快照，因此 HBM 趋势由本仓库每日采集自行累积（`data/hbm_prices.csv`，自 2026-09-16 起） |
+
+## 看板图表
+
+`docs/index.html` 为自包含 ECharts 看板（数据内嵌，可直接 `file://` 打开）：
+
+1. **DDR5 / DDR4 均价** 指标卡 + 累计天数
+2. **HBM 价格（USD/stack）**：各品种最新 stack 价 + 日环比 + 柱状对比
+3. **HBM 每 stack 价格走势（USD/stack）**：每日累积折线
+4. **HBM 每 GB 价格走势（USD/GB）**：每日累积折线（>40 天自动出现缩放条）
+5. **DDR 与 HBM 价格走势对比（USD/GB）**：DDR4/DDR5 均价（实线）+ HBM 各代（虚线），用于横向比较每 GB 单价
+6. **最新价格分布（USD/GB）**：DDR4/DDR5 最低/均价/最高
+
+> 涨跌配色为国内口径：**红涨绿跌**；HBM 的涨跌幅为「日环比」，由本仓库自己累积的价格序列计算，不直接采用上游页面的 24h 涨跌幅。
 
 ## 快速开始
 
