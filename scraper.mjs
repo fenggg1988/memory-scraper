@@ -28,6 +28,8 @@ const RAMRADAR_CSV_URL = "https://ramradar.app/ram-price-index/data.csv";
 
 // memoryindex.io — HBM / DDR5 现货与合约价聚合（含 HBM3 / HBM3E / HBM4 每 stack 价格）
 const MEMORYINDEX_URL = "https://memoryindex.io/zh";
+// 官方公开样例 CSV（结构化，含 unit/source/as_of/30日与同比涨跌），HBM 首选数据源
+const HBM_API_URL = "https://memoryindex.io/api/public/sample-prices.csv";
 
 // ── 工具函数 ──
 
@@ -66,6 +68,19 @@ function round2(x) {
   return Math.round((x + Number.EPSILON) * 100) / 100;
 }
 
+/**
+ * 读 CSV 为行数组（已去掉 \r）。
+ * 注意：Windows 下 git（autocrlf）会把仓库里的 LF 换成 CRLF，
+ * 若不过滤 \r，行尾字段会带上 "\r"，导致表头变成 "sample_count\r" 之类的脏 key。
+ */
+function readCsvLines(fp) {
+  return fs
+    .readFileSync(fp, "utf-8")
+    .replace(/\r/g, "")
+    .split("\n")
+    .filter((l) => l.trim() !== "");
+}
+
 export function saveCSV(filename, rows, dataDir = DATA_DIR) {
   fs.mkdirSync(dataDir, { recursive: true });
   const fp = path.join(dataDir, filename);
@@ -76,7 +91,7 @@ export function saveCSV(filename, rows, dataDir = DATA_DIR) {
 
   const seen = new Set();
   if (fs.existsSync(fp)) {
-    const existing = fs.readFileSync(fp, "utf-8").trim().split("\n").slice(1);
+    const existing = readCsvLines(fp).slice(1);
     existing.forEach((line) => {
       const date = line.split(",")[0];
       if (date) seen.add(date);
@@ -175,14 +190,27 @@ export function buildDailyRows(allRows) {
 
 // ── HBM 价格（memoryindex.io 聚合，TrendForce / Silicon Analysts 口径）──
 //
-// 页面以 <span class="text-muted-foreground">HBM3E-36G</span>
-//        <span class="text-foreground">$299.93</span>
-//        <span class="text-down">-0.10%</span> 的形式列出各品种。
-// 我们抓 HBM* 品种，并按其标称容量换算 $/GB。
+// 页面有两种呈现：
+//   1) 顶部滚动条（marquee）：<span class="text-muted-foreground">HBM3E-36G</span>
+//      <span class="text-foreground">$2,108.00</span><span class="text-up">+0.26%</span>
+//   2) 主价格表（权威，含来源与口径日期）：<div class="num text-xs text-primary">HBM3E-36G</div>
+//      ... <td class="num ... text-right text-sm">US$2,108.00<div ...>¥15,009</div></td>
+//      ... 来源链接 + <div class="num mt-1 text-[10px] text-muted-foreground">2026-07</div>
+//
+// 我们优先用主价格表（能拿到 source_label / as_of，便于识别上游换源、换口径），
+// 表解析失败时回退到 marquee。只取 HBM* 品种，按标称容量换算 $/GB。
+
+/** 口径断点标记：同一品种相邻观测值相差超过阈值 → 上游换了报价口径/来源，不是真实行情 */
+export const BREAK_FLAG = "basis_break";
+const BREAK_RATIO = 1.5; // >1.5x 或 <1/1.5x 视为断点
+
+const NUM = "([0-9][0-9,]*(?:\\.[0-9]+)?)";
 
 export function parseMemoryIndex(html) {
-  const re =
-    /text-muted-foreground">([A-Za-z0-9\-]{2,20})<\/span><span class="text-foreground">\$([0-9][0-9,]*\.?[0-9]*)<\/span><span class="text-(up|down)">([+-][0-9.]+)%/g;
+  const re = new RegExp(
+    `text-muted-foreground">([A-Za-z0-9\\-]{2,20})<\\/span><span class="text-foreground">\\$${NUM}<\\/span><span class="text-(up|down)">([+-][0-9.]+)%`,
+    "g"
+  );
   const out = [];
   const seen = new Set();
   let m;
@@ -204,12 +232,98 @@ export function parseMemoryIndex(html) {
       price_per_gb: capacity ? round2(price / capacity) : null,
       change_pct: isFinite(pctVal) ? pctVal : 0,
       change_dir: dir === "down" ? "down" : "up",
+      source_label: null,
+      as_of: null,
+      unit: null,
     });
   }
   return out;
 }
 
+/** 解析主价格表（权威来源，含来源名与口径日期） */
+export function parseMemoryIndexTable(html) {
+  const out = [];
+  const rows = html.split(/<tr[^>]*>/).slice(1);
+  for (const row of rows) {
+    const itemM = row.match(/text-xs text-primary">([A-Za-z0-9\-]{2,20})</);
+    if (!itemM) continue;
+    const item = itemM[1];
+    const nameM = row.match(/text-xs font-medium">([^<]{2,60})</);
+    const unitM = row.match(/mt-1 text-\[10px\] text-muted-foreground">([^<]{1,20})</);
+    // 现货价：第一个 text-right text-sm 单元格
+    const spotM = row.match(new RegExp(`text-right text-sm">US\\$${NUM}`));
+    if (!spotM) continue;
+    const price = parseFloat(spotM[1].replace(/,/g, ""));
+    if (!isFinite(price)) continue;
+    // 当日 / 30日 高低的 US$ 数值（按出现顺序取 4 个）
+    const highs = [...row.matchAll(new RegExp(`text-(?:up|down)">US\\$${NUM}`, "g"))].map((x) =>
+      parseFloat(x[1].replace(/,/g, ""))
+    );
+    // 30日涨跌 / 同比
+    const pcts = [...row.matchAll(new RegExp(`text-xs text-(?:up|down)">([+-]?[0-9.]+)%`, "g"))].map(
+      (x) => parseFloat(x[1])
+    );
+    const srcM = row.match(/hover:underline">([^<]{2,80})</) || row.match(/<a [^>]*>([^<]{2,80})<\/a>/);
+    const asOfM = row.match(/mt-1 text-\[10px\] text-muted-foreground">([0-9]{4}-[0-9]{2})</);
+    const capMatch = item.match(/-(\d+)G$/);
+    const capacity = capMatch ? parseInt(capMatch[1], 10) : null;
+    out.push({
+      item,
+      name: nameM ? nameM[1] : null,
+      unit: unitM ? unitM[1] : null,
+      price_usd: price,
+      capacity_gb: capacity,
+      price_per_gb: capacity ? round2(price / capacity) : null,
+      day_high: highs[0] ?? null,
+      day_low: highs[1] ?? null,
+      d30_high: highs[2] ?? null,
+      d30_low: highs[3] ?? null,
+      change_pct: pcts[0] ?? null,
+      yoy_pct: pcts[1] ?? null,
+      source_label: srcM ? srcM[1].trim() : null,
+      as_of: asOfM ? asOfM[1] : null,
+      change_dir: null,
+    });
+  }
+  return out;
+}
+
+/** 标记「口径断点」：相邻两日同品种价格突变超过阈值，或 unit 变化（上游换源/换单位，非真实行情） */
+export function markBreaks(rows) {
+  const byItem = new Map();
+  for (const r of rows) {
+    if (!byItem.has(r.item)) byItem.set(r.item, []);
+    byItem.get(r.item).push(r);
+  }
+  for (const list of byItem.values()) {
+    list.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    for (let i = 1; i < list.length; i++) {
+      const prev = list[i - 1];
+      const cur = list[i];
+      let broke = false;
+      const p = prev.price_usd;
+      const c = cur.price_usd;
+      if (p > 0 && c > 0) {
+        const ratio = c / p;
+        if (ratio > BREAK_RATIO || ratio < 1 / BREAK_RATIO) broke = true;
+      }
+      if (prev.unit && cur.unit && prev.unit !== cur.unit) broke = true;
+      if (broke) cur.flag = BREAK_FLAG;
+    }
+  }
+  return rows;
+}
+
 export async function fetchHbm() {
+  // 优先用官方公开 API 样例 CSV：结构化字段（unit / source / as_of / 30日与同比涨跌），
+  // 比 HTML 抓取可靠，且能直接看出上游是否换了口径或来源。
+  try {
+    const api = await fetchHbmApi();
+    if (api.length > 0) return { rows: api, via: "api" };
+  } catch (e) {
+    console.warn(`  HBM API fetch failed, falling back to HTML: ${e.message}`);
+  }
+
   const res = await fetch(MEMORYINDEX_URL, {
     headers: {
       "User-Agent":
@@ -218,71 +332,163 @@ export async function fetchHbm() {
   });
   if (!res.ok) throw new Error(`Failed to fetch ${MEMORYINDEX_URL}: HTTP ${res.status}`);
   const html = await res.text();
-  return parseMemoryIndex(html).filter((r) => r.item.startsWith("HBM"));
+  const table = parseMemoryIndexTable(html).filter((r) => r.item.startsWith("HBM"));
+  if (table.length > 0) return { rows: table, via: "table" };
+  const marquee = parseMemoryIndex(html).filter((r) => r.item.startsWith("HBM"));
+  return { rows: marquee, via: "marquee" };
+}
+
+/**
+ * 解析官方公开样例 CSV（https://memoryindex.io/api/public/sample-prices.csv）
+ * 表头：session_utc,contract_id,ticker,name,segment,unit,spot_usd,chg_24h_pct,chg_30d_pct,chg_yoy_pct,basis,as_of,source
+ */
+export function parseHbmApiCsv(text) {
+  const lines = text.replace(/\r/g, "").trim().split("\n");
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",").map((h) => h.trim());
+  const idx = (name) => headers.indexOf(name);
+  const out = [];
+  for (const line of lines.slice(1)) {
+    const cells = line.split(",");
+    const get = (name) => {
+      const i = idx(name);
+      return i >= 0 && cells[i] !== undefined ? cells[i].trim() : "";
+    };
+    if (get("segment") !== "HBM") continue;
+    const ticker = get("ticker");
+    const price = parseFloat(get("spot_usd"));
+    if (!ticker || !isFinite(price)) continue;
+    const capMatch = ticker.match(/-(\d+)G$/);
+    const capacity = capMatch ? parseInt(capMatch[1], 10) : null;
+    // source 字段可能含逗号，被 split 拆碎 —— 用 header 之后的剩余片段拼回
+    const srcIdx = idx("source");
+    const source = srcIdx >= 0 ? cells.slice(srcIdx).join(",").trim() : "";
+    out.push({
+      item: ticker,
+      name: get("name").replace(/^"|"$/g, ""),
+      unit: get("unit").replace(/^"|"$/g, ""),
+      price_usd: price,
+      capacity_gb: capacity,
+      price_per_gb: capacity ? round2(price / capacity) : null,
+      change_pct: parseFloat(get("chg_24h_pct")),
+      d30_pct: parseFloat(get("chg_30d_pct")),
+      yoy_pct: parseFloat(get("chg_yoy_pct")),
+      source_label: source.replace(/^"|"$/g, ""),
+      as_of: get("as_of"),
+      basis: get("basis"),
+      change_dir: null,
+    });
+  }
+  return out;
+}
+
+async function fetchHbmApi() {
+  const res = await fetch(HBM_API_URL, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 memory-price-scraper/2.2",
+    },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${HBM_API_URL}`);
+  return parseHbmApiCsv(await res.text());
 }
 
 const HBM_CSV = "hbm_prices.csv";
+/** HBM CSV 列顺序（含 source_label/as_of/unit 用于溯源，flag 用于口径断点标记） */
+export const HBM_FIELDS = [
+  "date",
+  "source",
+  "item",
+  "capacity_gb",
+  "price_usd",
+  "price_per_gb",
+  "unit",
+  "change_pct",
+  "d30_pct",
+  "yoy_pct",
+  "source_label",
+  "as_of",
+  "flag",
+];
 
+function hbmFieldValue(r, f) {
+  const v = r[f];
+  if (v === undefined || v === null) return "";
+  // 简单 CSV 转义：字段里的逗号换成「;」（source 名称里可能出现逗号），避免破坏列结构
+  return String(v).replace(/[",]/g, (c) => (c === "," ? ";" : ""));
+}
+
+/**
+ * 合并式写入：读旧行 → 合并新行（按 date+source+item 去重）→ 标记口径断点 → 按日期排序重写。
+ * 重写而非追加，保证历史行的 flag 与列结构始终一致。
+ */
 function saveHbmCSV(rows, dataDir = DATA_DIR) {
   const fp = path.join(dataDir, HBM_CSV);
   fs.mkdirSync(dataDir, { recursive: true });
   if (rows.length === 0) return { filePath: fp, addedRows: 0 };
 
-  if (!fs.existsSync(fp)) {
-    fs.writeFileSync(
-      fp,
-      "date,source,item,capacity_gb,price_usd,price_per_gb,change_pct\n"
-    );
-  }
-  const seen = new Set(
-    fs
-      .readFileSync(fp, "utf-8")
-      .trim()
-      .split("\n")
-      .slice(1)
-      .filter(Boolean)
-      .map((l) => l.split(",").slice(0, 3).join(","))
-  );
-  const fresh = rows.filter((r) => !seen.has(`${r.date},${r.source},${r.item}`));
-  if (fresh.length === 0) return { filePath: fp, addedRows: 0 };
+  const existing = loadHbmRows(dataDir);
+  const { rows: merged0, added } = mergeHbmRows(existing, rows);
 
-  const lines = fresh
-    .map((r) =>
-      [
-        r.date,
-        r.source,
-        r.item,
-        r.capacity_gb ?? "",
-        r.price_usd,
-        r.price_per_gb ?? "",
-        r.change_pct,
-      ].join(",")
-    )
+  const merged = markBreaks(merged0);
+  merged.sort((a, b) =>
+    a.date === b.date
+      ? String(a.item).localeCompare(String(b.item))
+      : String(a.date).localeCompare(String(b.date))
+  );
+
+  const body = merged
+    .map((r) => HBM_FIELDS.map((f) => hbmFieldValue(r, f)).join(","))
     .join("\n");
-  fs.appendFileSync(fp, lines + "\n");
-  return { filePath: fp, addedRows: fresh.length };
+  fs.writeFileSync(fp, HBM_FIELDS.join(",") + "\n" + body + "\n");
+  return { filePath: fp, addedRows: added };
 }
 
-function loadHbmRows() {
-  const fp = path.join(DATA_DIR, HBM_CSV);
+/**
+ * 合并新旧 HBM 行（键 = 日期 + 品种）：
+ *  - 新日期 → 追加
+ *  - 已有该日 → 只补齐缺失的元数据（unit / source_label / as_of / 30日 / 同比），价格保持首次抓取值
+ */
+function mergeHbmRows(existing, incoming) {
+  const key = (r) => `${r.date}|${r.item}`;
+  const map = new Map(existing.map((r) => [key(r), r]));
+  let added = 0;
+  for (const r of incoming) {
+    const k = key(r);
+    const cur = map.get(k);
+    if (!cur) {
+      map.set(k, r);
+      added += 1;
+      continue;
+    }
+    for (const f of ["unit", "name", "basis", "source_label", "as_of", "d30_pct", "yoy_pct"]) {
+      const empty = cur[f] === undefined || cur[f] === null || cur[f] === "";
+      const has = r[f] !== undefined && r[f] !== null && r[f] !== "" && !Number.isNaN(r[f]);
+      if (empty && has) cur[f] = r[f];
+    }
+  }
+  return { rows: [...map.values()], added };
+}
+
+function loadHbmRows(dataDir = DATA_DIR) {
+  const fp = path.join(dataDir, HBM_CSV);
   if (!fs.existsSync(fp)) return [];
-  const lines = fs.readFileSync(fp, "utf-8").trim().split("\n");
+  const lines = readCsvLines(fp);
   if (lines.length < 2) return [];
-  const headers = lines[0].split(",");
-  return lines.slice(1).filter(Boolean).map((line) => {
+  const headers = lines[0].split(",").map((h) => h.trim());
+  const textFields = new Set(["date", "source", "item", "unit", "source_label", "as_of", "flag"]);
+  const rows = lines.slice(1).map((line) => {
     const vals = line.split(",");
     const obj = {};
     headers.forEach((h, i) => {
-      const v = vals[i];
-      obj[h] =
-        h === "date" || h === "source" || h === "item"
-          ? v
-          : v === ""
-            ? null
-            : parseFloat(v);
+      const v = vals[i] === undefined ? "" : vals[i];
+      obj[h] = textFields.has(h) ? (v === "" ? (h === "flag" ? null : "") : v) : v === "" ? null : parseFloat(v);
     });
+    if (!obj.flag) obj.flag = null;
     return obj;
   });
+  // 历史行可能没有 flag 列（旧版本写入），这里统一重算
+  return markBreaks(rows);
 }
 
 function exportJSON() {
@@ -291,15 +497,15 @@ function exportJSON() {
   const csvPath = path.join(DATA_DIR, "ram_prices.csv");
   if (!fs.existsSync(csvPath)) return;
 
-  const lines = fs.readFileSync(csvPath, "utf-8").trim().split("\n");
+  const lines = readCsvLines(csvPath);
   if (lines.length < 2) return;
 
-  const headers = lines[0].split(",");
+  const headers = lines[0].split(",").map((h) => h.trim());
   const json = lines.slice(1).map((line) => {
     const vals = line.split(",");
     const obj = {};
     headers.forEach((h, i) => {
-      const v = vals[i];
+      const v = (vals[i] ?? "").trim();
       if (["avg_price", "min_price", "max_price", "sample_count"].includes(h)) {
         obj[h] = parseFloat(v);
       } else {
@@ -414,12 +620,22 @@ const HBM_FALLBACK = ["#3498db", "#9b59b6", "#e67e22", "#1abc9c", "#f1c40f"];
 const hbmColor = (it, i) => HBM_PALETTE[it] || HBM_FALLBACK[i % HBM_FALLBACK.length];
 const HBM_ITEMS = [...new Set(HBM_DATA.map(r => r.item))].sort();
 const HBM_DATES = [...new Set(HBM_DATA.map(r => r.date))].sort();
+const HBM_BREAK = "basis_break";
+const hbmRow = (d, it) => HBM_DATA.find(x => x.date === d && x.item === it) || null;
+const isBreak = r => !!r && r.flag === HBM_BREAK;
+const BREAK_DATES = [...new Set(HBM_DATA.filter(isBreak).map(r => r.date))].sort();
 
-// 日环比：用本看板自己累积的价格序列计算（不依赖来源的 24h 涨跌幅，避免口径/符号问题）
+// 口径断点后的「有效观测」= 该品种在断点之后（含断点当日）的数据，用于日环比时的同口径比较
+function hbmObs(item) {
+  return HBM_DATES.map(d => hbmRow(d, item)).filter(Boolean);
+}
+
+// 日环比：只用「同一口径内」相邻两天计算；跨断点或断点当日一律返回 null，避免出现 ×7 这种假暴涨
 function hbmDayChange(item) {
-  const rows = HBM_DATES.map(d => HBM_DATA.find(x => x.date === d && x.item === item)).filter(Boolean);
-  if (rows.length < 2) return null;
-  const cur = rows[rows.length - 1], prev = rows[rows.length - 2];
+  const obs = hbmObs(item);
+  if (obs.length < 2) return null;
+  const cur = obs[obs.length - 1], prev = obs[obs.length - 2];
+  if (isBreak(cur) || isBreak(prev)) return null;
   if (!prev.price_usd) return null;
   return (cur.price_usd - prev.price_usd) / prev.price_usd * 100;
 }
@@ -429,23 +645,42 @@ const upDownColor = v => v > 0 ? "#e74c3c" : (v < 0 ? "#27ae60" : "#7f8c8d");
 const upDownArrow = v => v > 0 ? "▲" : (v < 0 ? "▼" : "—");
 
 // 通用折线趋势图配置（与 DDR 走势图同款样式）
-function hbmLineOption(metric, axisName, unitSuffix, dateLabel) {
+// 口径断点：断点当日不参与连线（置 null），并在断点日期画一条竖线标注，避免把换源前后的价格连成一条假趋势
+function hbmLineOption(metric, axisName, unitSuffix) {
   const series = HBM_ITEMS.map((it, i) => ({
     name: it, type: "line", smooth: true, connectNulls: false,
     symbol: "circle", symbolSize: HBM_DATES.length <= 3 ? 8 : 5,
     data: HBM_DATES.map(d => {
-      const r = HBM_DATA.find(x => x.date === d && x.item === it);
-      return r ? r[metric] : null;
+      const r = hbmRow(d, it);
+      if (!r) return null;
+      return isBreak(r) ? null : r[metric];
     }),
     lineStyle: { color: hbmColor(it, i), width: 2 },
     itemStyle: { color: hbmColor(it, i) },
     emphasis: { focus: "series" },
   }));
+
+  // 断点日期竖向标注（挂在第一条 series 上，图例只出现一次）
+  if (BREAK_DATES.length && series.length) {
+    series[0].markLine = {
+      silent: true, symbol: "none",
+      lineStyle: { color: "#e67e22", type: "dashed", width: 1 },
+      label: { formatter: "口径变更", color: "#e67e22", fontSize: 10, position: "insideEndTop" },
+      data: BREAK_DATES.map(d => ({ xAxis: d })),
+    };
+  }
+
   const needZoom = HBM_DATES.length > 40;
   return {
     tooltip: {
       trigger: "axis",
-      valueFormatter: v => v == null ? "-" : "$" + Number(v).toFixed(2) + unitSuffix,
+      valueFormatter: (v, p) => {
+        if (v == null) {
+          const r = hbmRow(HBM_DATES[p.dataIndex], p.seriesName);
+          return isBreak(r) ? "口径变更（不连线）" : "-";
+        }
+        return "$" + Number(v).toFixed(2) + unitSuffix;
+      },
     },
     legend: { data: HBM_ITEMS, bottom: 0 },
     grid: { left: 66, right: 24, top: 16, bottom: needZoom ? 58 : 34 },
@@ -479,9 +714,17 @@ function renderHbm() {
 
   el.innerHTML = latestHbm.map(r => {
     const dod = hbmDayChange(r.item);
-    const chg = dod == null
-      ? '<span style="color:#7f8c8d">— 日环比待累积</span>'
-      : '<span style="color:' + upDownColor(dod) + '">' + upDownArrow(dod) + Math.abs(dod).toFixed(2) + '% 日环比</span>';
+    let chg;
+    if (dod != null) {
+      chg = '<span style="color:' + upDownColor(dod) + '">' + upDownArrow(dod) + Math.abs(dod).toFixed(2) + '% 日环比</span>';
+    } else {
+      const obs = hbmObs(r.item);
+      const prev = obs.length >= 2 ? obs[obs.length - 2] : null;
+      const why = isBreak(r) ? '口径变更日，不计算日环比'
+        : (prev && isBreak(prev)) ? '日环比不可比（前值口径变更）'
+        : '日环比待累积';
+      chg = '<span style="color:#7f8c8d">— ' + why + '</span>';
+    }
     const perGb = r.price_per_gb ? (" · $" + r.price_per_gb.toFixed(2) + "/GB") : "";
     return '<div class="stat"><div class="val">$' + r.price_usd.toFixed(2) + '</div>' +
       '<div class="lbl">' + r.item + perGb + '<br>' + chg + '</div></div>';
@@ -489,18 +732,30 @@ function renderHbm() {
 
   const note = document.getElementById("hbm-note");
   if (note) {
-    note.textContent = "最新日期 " + latestHbmDate + "，已累积 " + HBM_DATES.length + " 天（自 " +
-      HBM_DATES[0] + " 起）· 数据源 memoryindex.io（TrendForce / Silicon Analysts 口径），" +
-      "上游无免费历史接口，趋势由本看板每日采集累积 · 涨跌幅为日环比（红涨绿跌）";
+    const parts = [
+      "最新日期 " + latestHbmDate + "，已累积 " + HBM_DATES.length + " 天（自 " + HBM_DATES[0] + " 起）",
+      "数据源 memoryindex.io 官方公开 API（api/public/sample-prices.csv，HTML 表为回退），含 unit/来源/口径日期，趋势由本看板每日采集累积",
+      "涨跌幅为日环比（红涨绿跌）",
+    ];
+    if (BREAK_DATES.length) {
+      const detail = HBM_DATA.filter(isBreak).map(r => r.item + " " + r.date).join("、");
+      parts.push(
+        "⚠ 检测到上游口径变更： " + detail + "（价格突变 >1.5 倍，疑为上游换源或误按人民币折算），" +
+        "该点已标记为断点，不参与连线与日环比计算"
+      );
+    }
+    const srcs = [...new Set(HBM_DATA.filter(r => r.source_label).map(r => r.item + ": " + r.source_label + (r.as_of ? " (" + r.as_of + ")" : "")))];
+    if (srcs.length) parts.push("上游标注来源 — " + srcs.join("；"));
+    note.textContent = parts.join(" · ");
   }
 
   // 每 stack 价格走势（折线，每日累积）
   echarts.init(document.getElementById("hbm-stack-trend"))
-    .setOption(hbmLineOption("price_usd", "USD/stack", "/stack", "每 stack"));
+    .setOption(hbmLineOption("price_usd", "USD/stack", "/stack"));
 
   // 每 GB 价格走势（折线，每日累积）
   echarts.init(document.getElementById("hbm-trend"))
-    .setOption(hbmLineOption("price_per_gb", "USD/GB", "/GB", "每 GB"));
+    .setOption(hbmLineOption("price_per_gb", "USD/GB", "/GB"));
 
   // 当日各品种每 stack 价格
   const hbmBar = echarts.init(document.getElementById("hbm-bar"));
@@ -550,8 +805,9 @@ if (DATA.length === 0) {
     name: it, type: "line", smooth: true, connectNulls: false,
     symbol: "circle", symbolSize: 5,
     data: dates.map(d => {
-      const r = HBM_DATA.find(x => x.date === d && x.item === it);
-      return r ? r.price_per_gb : null;
+      const r = hbmRow(d, it);
+      // 口径断点当日不连线（否则会把换源前后的价格连成假趋势）
+      return r && !isBreak(r) ? r.price_per_gb : null;
     }),
     lineStyle: { color: hbmColor(it, i), width: 2, type: "dashed" },
     itemStyle: { color: hbmColor(it, i) },
@@ -643,17 +899,37 @@ export async function main() {
 
   console.log("\n── HBM prices (memoryindex.io) ──");
   try {
-    const hbm = await withRetries(() => fetchHbm(), {
+    const { rows: hbm, via } = await withRetries(() => fetchHbm(), {
       attempts: 3,
       delayMs: 2_000,
       label: "memoryindex fetch",
     });
+    console.log(`  Parsed via ${via === "api" ? "官方 API 样例 CSV" : via === "table" ? "主价格表" : "顶部滚动条（回退）"}`);
     if (hbm.length > 0) {
       const rows = hbm.map((r) => ({ date: TODAY, source: "memoryindex", ...r }));
       const savedHbm = saveHbmCSV(rows);
       console.log(
-        `  HBM items: ${hbm.map((r) => r.item + " $" + r.price_usd + " ($" + r.price_per_gb + "/GB)").join(", ")}`
+        `  HBM items: ${hbm
+          .map(
+            (r) =>
+              r.item +
+              " $" +
+              r.price_usd +
+              " ($" +
+              r.price_per_gb +
+              "/GB" +
+              (r.source_label ? ", 来源: " + r.source_label + " " + (r.as_of || "") : "") +
+              ")"
+          )
+          .join("; ")}`
       );
+      const flagged = loadHbmRows().filter((r) => r.flag === BREAK_FLAG);
+      if (flagged.length > 0) {
+        console.warn(
+          `  ⚠ 检测到 ${flagged.length} 条口径断点（相邻日价格突变 >${BREAK_RATIO}x，已标记不参与连线/日环比）: ` +
+            flagged.map((r) => `${r.date} ${r.item} $${r.price_usd}`).join(", ")
+        );
+      }
       console.log(
         savedHbm.addedRows > 0
           ? `  Saved ${savedHbm.addedRows} new HBM rows → ${savedHbm.filePath}`

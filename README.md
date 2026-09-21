@@ -23,10 +23,25 @@
 | 项目 | 说明 |
 |---|---|
 | 站点 | memoryindex.io（HBM 价格聚合） |
-| 接口 | `https://memoryindex.io/zh` 页面内嵌报价（HTML 解析） |
+| 接口（首选） | `https://memoryindex.io/api/public/sample-prices.csv`（官方公开样例 CSV，结构化，含 `unit` / `source` / `as_of` / 30日与同比涨跌） |
+| 接口（回退） | `https://memoryindex.io/zh` 页面解析：主价格表 →（表结构不完整时）顶部滚动条 |
 | 口径 | HBM3-24G / HBM3E-36G / HBM4-48G 每 stack 美元价 + 隐含 USD/GB + 日涨跌 |
 | 更新 | 跟随站点更新节奏；本仓库每次运行时同步抓取 |
-| 历史 | 上游的 5 年历史序列属付费 API（<https://memoryindex.io/api-plans>），免费页面只给当日快照，因此 HBM 趋势由本仓库每日采集自行累积（`data/hbm_prices.csv`，自 2026-09-16 起） |
+| 历史 | 上游的 5 年历史序列属付费 API（<https://memoryindex.io/api-plans>），免费接口只给当日快照，因此 HBM 趋势由本仓库每日采集自行累积（`data/hbm_prices.csv`，自 2026-09-16 起） |
+
+### 口径断点（重要）
+
+`data/hbm_prices.csv` 的 `flag` 列标记**口径断点**：同一品种相邻两次观测价格突变超过 1.5 倍，或 `unit` 字段变化。
+这类跳变通常不是真实行情，而是上游换了报价来源/单位或误按其它币种折算。
+
+已记录的一例：**2026-09-18**，上游把 HBM3E-36G 与 HBM4-48G 的来源从
+「Silicon Analysts HBM pricing table（2026-07）」换成
+「TrendForce citing Seoul Economic Daily spot-market reporting（2026-09-01）」，
+数值一次性放大约 **7.05 倍**（HBM3E 299 → 2107、HBM4 498 → 3474），而同一页面的 HBM3-24G 未变（≈200）。
+换算后每 GB 单价（HBM3 $8.33 vs HBM3E $58.56 vs HBM4 $73.06）与代际正常价差（约 1.2–1.5 倍）明显不符，
+且放大倍数与上游自用的人民币参考汇率 7.12 高度接近，判断为**上游换源引入的口径问题**，非真实涨价。
+
+处理方式：断点当日不参与折线连线与日环比计算，看图板上的「口径变更」竖线与说明文字。
 
 ## 看板图表
 
