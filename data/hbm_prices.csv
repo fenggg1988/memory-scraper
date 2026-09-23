@@ -11,3 +11,6 @@ date,source,item,capacity_gb,price_usd,price_per_gb,unit,change_pct,d30_pct,yoy_
 2026-09-21,memoryindex,HBM3-24G,24,199.88,8.33,USD / stack,-0.2,-0.2,4,Silicon Analysts HBM pricing table,2026-07,
 2026-09-21,memoryindex,HBM3E-36G,36,2108,58.56,USD / stack,0.07,0.07,14,TrendForce citing Seoul Economic Daily spot-market reporting,2026-09-01,
 2026-09-21,memoryindex,HBM4-48G,48,3507,73.06,USD / stack,-0.09,0.75,0,TrendForce citing Seoul Economic Daily spot-market reporting,2026-09-01,
+2026-09-23,memoryindex,HBM3-24G,24,199.85,8.33,USD / stack,-0.26,0.19,4,Silicon Analysts HBM pricing table,2026-07,
+2026-09-23,memoryindex,HBM3E-36G,36,2093,58.14,USD / stack,-0.21,-0.03,14,TrendForce citing Seoul Economic Daily spot-market reporting,2026-09-01,
+2026-09-23,memoryindex,HBM4-48G,48,3500,72.92,USD / stack,-0.06,0.31,0,TrendForce citing Seoul Economic Daily spot-market reporting,2026-09-01,
