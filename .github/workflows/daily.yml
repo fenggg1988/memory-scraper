@@ -34,5 +34,6 @@ jobs:
             echo "No data changes to commit"
           else
             git commit -m "chore: daily memory price update $(date -u +%F)"
+          git pull --rebase --autostash origin "$(git branch --show-current)" || true
             git push
           fi
