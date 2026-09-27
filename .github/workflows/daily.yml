@@ -5,6 +5,7 @@ on:
   schedule:
     # 10:00 Beijing time (UTC+8) == 02:00 UTC
     - cron: "0 2 * * *"
+    - cron: "0 8 * * *"
   workflow_dispatch:
 
 permissions:
