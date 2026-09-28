@@ -49,7 +49,7 @@ jobs:
       # 注意：GITHUB_TOKEN 无法触发 workflow_dispatch（防递归），必须用 PAT(CHAIN_TOKEN)。
       # 每次成功运行后主动触发下一个项目，形成自链式调度。
       - name: Trigger next project (chain)
-        if: success() && github.event.inputs.chain != '1'
+        if: success()
         run: |
           curl -s -X POST \
             -H "Authorization: Bearer ${{ secrets.CHAIN_TOKEN }}" \
