@@ -7,11 +7,11 @@ on:
     - cron: "0 2 * * *"
     - cron: "0 8 * * *"
   workflow_dispatch:
-  inputs:
-    chain:
-      description: "内部使用：链式调度传来的标记，勿手动填写"
-      required: false
-      default: "0"
+    inputs:
+      chain:
+        description: "内部使用：链式调度传来的标记，勿手动填写"
+        required: false
+        default: "0"
 
 permissions:
   contents: write
