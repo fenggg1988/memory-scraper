@@ -7,6 +7,13 @@
 
 > 说明：HBM 没有集中交易所，市面上的 HBM 报价多为经纪商调查价或合约价估算，且 HBM 以「整 stack」议价，本看板记录的是各代 stack 价格及其隐含 $/GB，用于观察代际价格趋势，不等于可成交价。
 
+## 在线看板（GitHub Pages，云端自动更新）
+
+**https://fenggg1988.github.io/memory-scraper/**
+
+数据由 GitHub Actions 每天在云端自动抓取并提交，GitHub Pages 随之自动重建，因此
+**不需要本地电脑开机、也不需要打开任何软件**。本页数据随时是最新的。
+
 ## 为什么用 RamRadar 而不是 ZOL
 
 原方案抓的是「中关村在线（ZOL）」国内电商价，但 ZOL 在 GitHub Actions 的**海外服务器上无法访问**（DNS 解析失败 / 被墙）。RamRadar 是美国站点、提供直接可下载的公开 CSV，海外服务器可正常抓取，且价格归一化为 `$/GB`，比整条模组的人民币价更可比。
