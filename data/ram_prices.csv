@@ -685,3 +685,5 @@ date,source,category,avg_price,min_price,max_price,sample_count
 2026-10-14,ramradar,DDR5,17.2,13.16,27.15,167
 2026-10-15,ramradar,DDR4,7.74,4.75,11.63,91
 2026-10-15,ramradar,DDR5,17.07,12.5,27.15,165
+2026-10-16,ramradar,DDR4,8.08,5.15,12.38,90
+2026-10-16,ramradar,DDR5,18.95,14.05,30.4,170
