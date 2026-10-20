@@ -1,11 +1,14 @@
-# Memory Price Scraper (DDR4 / DDR5 / HBM)
+# Memory Price Scraper (DDR4 / DDR5 / HBM / NAND)
 
-每日追踪 **DDR4 / DDR5 桌面内存（DIMM）零售价格** 与 **HBM（HBM3 / HBM3E / HBM4）每 stack 价格**。
+每日追踪 **DDR4 / DDR5 桌面内存（DIMM）零售价格**、**HBM（HBM3 / HBM3E / HBM4）每 stack 价格** 与 **NAND Flash 晶圆现货价格**。
 
 - DDR4 / DDR5：数据源为 [RamRadar RAM Price Index](https://ramradar.app/ram-price-index)（聚合自 eBay / Newegg / B&H Photo 的公开零售价，归一化为 **USD/GB**）
 - HBM：数据源为 [memoryindex.io](https://memoryindex.io/zh)（聚合 TrendForce / DRAMeXchange / Silicon Analysts 的现货与合约报价，按 stack 计价并换算 **USD/GB**）
+- NAND：数据源为 [TrendForce NAND Flash 行情页](https://trendforce.com/index.php/price/flash) 的 **Wafer Spot Price**（512Gb / 256Gb / 128Gb TLC 现货，单位 **USD/颗 die**，按标称容量折算 USD/GB；失败回退 [DRAMeXchange](https://www.dramexchange.com/) 同源页面）
 
 > 说明：HBM 没有集中交易所，市面上的 HBM 报价多为经纪商调查价或合约价估算，且 HBM 以「整 stack」议价，本看板记录的是各代 stack 价格及其隐含 $/GB，用于观察代际价格趋势，不等于可成交价。
+>
+> NAND 报价同理：晶圆现货价是颗粒（die）批发价，不是 SSD 零售价；上游通常**每周才调整一次**，看板上价格横盘属正常现象。
 
 ## 在线看板（GitHub Pages，云端自动更新）
 
@@ -36,6 +39,14 @@
 | 更新 | 跟随站点更新节奏；本仓库每次运行时同步抓取 |
 | 历史 | 上游的 5 年历史序列属付费 API（<https://memoryindex.io/api-plans>），免费接口只给当日快照，因此 HBM 趋势由本仓库每日采集自行累积（`data/hbm_prices.csv`，自 2026-09-16 起） |
 
+| 项目 | 说明 |
+|---|---|
+| 站点 | TrendForce NAND Flash 行情页（回退：DRAMeXchange 首页，同源） |
+| 接口 | `https://trendforce.com/index.php/price/flash` 页面解析（无需 API key，海外可访问） |
+| 口径 | NAND Wafer Spot Price：512Gb TLC / 256Gb TLC / 128Gb TLC，USD/颗 die，折算 USD/GB（512Gb=64GB、256Gb=32GB、128Gb=16GB） |
+| 更新 | 上游通常每周调整一次报价；本仓库每日采集并记录（`data/nand_prices.csv`），上游未变动时为平台期 |
+| 历史 | 免费页面只有当前快照，NAND 趋势由本仓库每日采集自行累积（自 2026-10-20 起） |
+
 ### 口径断点（重要）
 
 `data/hbm_prices.csv` 的 `flag` 列标记**口径断点**：同一品种相邻两次观测价格突变超过 1.5 倍，或 `unit` 字段变化。
@@ -55,11 +66,13 @@
 `docs/index.html` 为自包含 ECharts 看板（数据内嵌，可直接 `file://` 打开）：
 
 1. **DDR5 / DDR4 均价** 指标卡 + 累计天数
-2. **HBM 价格（USD/stack）**：各品种最新 stack 价 + 日环比 + 柱状对比
-3. **HBM 每 stack 价格走势（USD/stack）**：每日累积折线
-4. **HBM 每 GB 价格走势（USD/GB）**：每日累积折线（>40 天自动出现缩放条）
-5. **DDR 与 HBM 价格走势对比（USD/GB）**：DDR4/DDR5 均价（实线）+ HBM 各代（虚线），用于横向比较每 GB 单价
-6. **最新价格分布（USD/GB）**：DDR4/DDR5 最低/均价/最高
+2. **NAND 晶圆现货价（USD/颗 die）**：各容量最新价 + $/GB + 涨跌 + 柱状对比
+3. **NAND 每 GB / 每 颗 价格走势**：每日累积折线（阶梯状，上游每周调价）
+4. **HBM 价格（USD/stack）**：各品种最新 stack 价 + 日环比 + 柱状对比
+5. **HBM 每 stack 价格走势（USD/stack）**：每日累积折线
+6. **HBM 每 GB 价格走势（USD/GB）**：每日累积折线（>40 天自动出现缩放条）
+7. **DDR 与 HBM 价格走势对比（USD/GB）**：DDR4/DDR5 均价（实线）+ HBM 各代（虚线），用于横向比较每 GB 单价
+8. **最新价格分布（USD/GB）**：DDR4/DDR5 最低/均价/最高
 
 > 涨跌配色为国内口径：**红涨绿跌**；HBM 的涨跌幅为「日环比」，由本仓库自己累积的价格序列计算，不直接采用上游页面的 24h 涨跌幅。
 
@@ -82,14 +95,16 @@ npm run scrape
 
 ```
 memory-scraper/
-├── scraper.mjs              # 主脚本：下载 CSV + 抓 HBM → 解析 → 写数据 + 看板
+├── scraper.mjs              # 主脚本：下载 CSV + 抓 HBM / NAND → 解析 → 写数据 + 看板
 ├── data/
 │   ├── ram_prices.csv       # DDR4/DDR5 时序（date, source, category, avg/min/max_price, sample_count）
-│   └── hbm_prices.csv       # HBM 时序（date, source, item, capacity_gb, price_usd, price_per_gb, change_pct）
+│   ├── hbm_prices.csv       # HBM 时序（date, source, item, capacity_gb, price_usd, price_per_gb, change_pct）
+│   └── nand_prices.csv      # NAND 晶圆现货时序（date, source, item, capacity_gb, price_usd, price_per_gb, upstream_updated）
 ├── docs/
 │   ├── ram_prices.json      # DDR 时序 JSON
 │   ├── hbm_prices.json      # HBM 时序 JSON
-│   └── index.html           # 自包含 ECharts 仪表盘（DDR + HBM）
+│   ├── nand_prices.json     # NAND 时序 JSON
+│   └── index.html           # 自包含 ECharts 仪表盘（DDR + HBM + NAND）
 └── .github/workflows/       # 每日自动运行配置
 ```
 
@@ -104,6 +119,20 @@ memory-scraper/
 | `category` | `DDR4` 或 `DDR5` |
 | `avg_price` / `min_price` / `max_price` | 当日 USD/GB 均价 / 最低 / 最高 |
 | `sample_count` | 参与统计的在售模组数量 |
+
+`data/nand_prices.csv` 每行一条记录：
+
+| 字段 | 含义 |
+|---|---|
+| `date` | 采集日期 YYYY-MM-DD |
+| `source` | `trendforce` 或 `dramexchange`（回退源，同源数据） |
+| `item` | `NAND-512Gb-TLC` / `NAND-256Gb-TLC` / `NAND-128Gb-TLC` |
+| `capacity_gb` | 标称容量（512Gb=64、256Gb=32、128Gb=16） |
+| `price_usd` | 现货报价（USD/颗 die，Session Average） |
+| `price_per_gb` | 折算单价 USD/GB |
+| `change_pct` | 上游标注的 Session Change（%） |
+| `upstream_updated` | 上游行情表最近更新时间（用于识别「上游没更新」与真实停抓） |
+| `flag` | `basis_break` = 口径断点（相邻日价格突变 >1.5 倍，不参与连线） |
 
 ## 维护
 

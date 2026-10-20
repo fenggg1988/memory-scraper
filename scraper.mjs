@@ -1,9 +1,13 @@
 /**
- * DRAM / Memory Price Tracker
+ * DRAM / HBM / NAND Price Tracker
  * ==================================
  * 数据源：RamRadar RAM Price Index（美国零售价，聚合自 eBay / Newegg / B&H Photo）
  *   公开 CSV：https://ramradar.app/ram-price-index/data.csv
  *   单位：美元每 GB（USD/GB），按内存模组（DIMM）规格归一化，可直接跨容量比较
+ *
+ * NAND 数据源：TrendForce NAND Flash Wafer Spot Price（现货，USD/颗 die）
+ *   https://trendforce.com/index.php/price/flash  （失败回退 https://www.dramexchange.com/）
+ *   取 512Gb / 256Gb / 128Gb TLC 三档，按标称容量折算 USD/GB，与 DRAM 可比
  *
  * 相比原来的 ZOL（中关村在线）方案：
  *   - 数据源位于美国，GitHub Actions 海外服务器可正常访问（ZOL 在国外被墙）
@@ -30,6 +34,14 @@ const RAMRADAR_CSV_URL = "https://ramradar.app/ram-price-index/data.csv";
 const MEMORYINDEX_URL = "https://memoryindex.io/zh";
 // 官方公开样例 CSV（结构化，含 unit/source/as_of/30日与同比涨跌），HBM 首选数据源
 const HBM_API_URL = "https://memoryindex.io/api/public/sample-prices.csv";
+
+// NAND Flash 晶圆现货价（TrendForce 公开行情表，与 DRAMeXchange 同源）
+const TRENDFORCE_FLASH_URL = "https://trendforce.com/index.php/price/flash";
+const DRAMEXCHANGE_URL = "https://www.dramexchange.com/";
+
+// 只取 TLC 三档主流容量（Gb → GB 按 /8 折算）
+const NAND_WAFER_ITEMS = ["512Gb TLC", "256Gb TLC", "128Gb TLC"];
+const NAND_CAPACITY_GB = { "512Gb TLC": 64, "256Gb TLC": 32, "128Gb TLC": 16 };
 
 // ── 工具函数 ──
 
@@ -393,6 +405,122 @@ async function fetchHbmApi() {
   return parseHbmApiCsv(await res.text());
 }
 
+// ── NAND 晶圆现货价（TrendForce / DRAMeXchange）──
+//
+// TrendForce 的 NAND Flash 行情页里有独立一张 “Wafer Spot Price” 表：
+//   Item | Weekly High | Weekly Low | Session High | Session Low | Session Average | Session Change
+//   512Gb TLC | 21.00 | 16.80 | 21.00 | 16.80 | 18.833 | 0.00 %
+// 报价口径为「USD / 颗（die）」，不是整片晶圆；按标称容量（512Gb=64GB）折算 $/GB 才能和 DDR 比。
+// 该表通常每周才动一次，所以每天抓到的值可能完全相同 —— 趋势图上是阶梯平台，属正常。
+
+const NAND_BROWSER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+function nandRow(item, nums, change, upstreamUpdated, dir) {
+  const capacity = NAND_CAPACITY_GB[item];
+  const avg = nums[4];
+  if (!isFinite(avg) || !capacity) return null;
+  return {
+    item: "NAND-" + item.replace(/\s+/g, "-"), // NAND-512Gb-TLC
+    capacity_gb: capacity,
+    price_usd: avg,
+    price_per_gb: round2(avg / capacity),
+    unit: "USD / die",
+    change_pct: Number.isFinite(change) ? change : null,
+    week_high: nums[0] ?? null,
+    week_low: nums[1] ?? null,
+    upstream_updated: upstreamUpdated,
+    change_dir: dir,
+  };
+}
+
+/** 解析 TrendForce flash 页的 Wafer Spot Price 表 */
+export function parseTrendforceWafer(html) {
+  const parts = html.split('<table class="price-table"');
+  for (let i = 1; i < parts.length; i++) {
+    const head = parts[i - 1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+    if (!/Wafer Spot Price/.test(head)) continue;
+
+    const upM = head.match(/Last Update\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})/);
+    const upstreamUpdated = upM ? `${upM[1]} ${upM[2]}` : "";
+
+    const rows = [];
+    for (const rm of parts[i].matchAll(/<tr>([\s\S]*?)<\/tr>/g)) {
+      const row = rm[1];
+      const nameM = row.match(/<td[^>]*>([\s\S]*?)<\/td>/);
+      if (!nameM) continue;
+      const item = nameM[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      if (!NAND_WAFER_ITEMS.includes(item)) continue;
+
+      const nums = [...row.matchAll(/<td class="lcd-num-l">\s*([0-9]+(?:\.[0-9]+)?)\s*<\/td>/g)].map(
+        (x) => parseFloat(x[1])
+      );
+      if (nums.length < 5) continue;
+
+      const dirM = row.match(/(flat|up|down)-trend/);
+      const chgM = row.match(/percent-cell[\s\S]*?([+-]?[0-9]+(?:\.[0-9]+)?)\s*%/);
+      const r = nandRow(item, nums, chgM ? parseFloat(chgM[1]) : NaN, upstreamUpdated,
+        dirM ? dirM[1] : null);
+      if (r) rows.push(r);
+    }
+    if (rows.length > 0) return { rows, upstream_updated: upstreamUpdated, via: "trendforce" };
+  }
+  return { rows: [], upstream_updated: "", via: "trendforce" };
+}
+
+/** 回退源：DRAMeXchange 首页（与 TrendForce 同源，结构不同） */
+export function parseDramexchangeWafer(html) {
+  const parts = html.split(/<table[^>]*>/i);
+  for (let i = 1; i < parts.length; i++) {
+    const head = parts[i - 1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+    if (!/Wafer Spot Price/.test(head)) continue;
+
+    const upM = head.match(/Last Update:?\s*([A-Za-z]{3}\.?\s*\d{1,2}\s+\d{4}\s+\d{2}:\d{2})/);
+    const upstreamUpdated = upM ? upM[1].replace(/\s+/g, " ").trim() : "";
+
+    const rows = [];
+    for (const rm of parts[i].matchAll(/<tr>([\s\S]*?)<\/tr>/g)) {
+      const row = rm[1];
+      const nameM = row.match(/tab_tr_gray2">([\s\S]*?)<\/td>/);
+      if (!nameM) continue;
+      const item = nameM[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      if (!NAND_WAFER_ITEMS.includes(item)) continue;
+
+      const nums = [...row.matchAll(/tab_tr_gray">\s*([0-9]+(?:\.[0-9]+)?)\s*<\/td>/g)].map(
+        (x) => parseFloat(x[1])
+      );
+      if (nums.length < 5) continue;
+
+      const chgM = row.match(/tab_tr_font9">[\s\S]*?([+-]?[0-9]+(?:\.[0-9]+)?)\s*%/);
+      const r = nandRow(item, nums, chgM ? parseFloat(chgM[1]) : NaN, upstreamUpdated, null);
+      if (r) rows.push(r);
+    }
+    if (rows.length > 0) return { rows, upstream_updated: upstreamUpdated, via: "dramexchange" };
+  }
+  return { rows: [], upstream_updated: "", via: "dramexchange" };
+}
+
+export async function fetchNand() {
+  const attempts = [
+    { url: TRENDFORCE_FLASH_URL, parse: parseTrendforceWafer, label: "trendforce" },
+    { url: DRAMEXCHANGE_URL, parse: parseDramexchangeWafer, label: "dramexchange" },
+  ];
+  let lastErr;
+  for (const a of attempts) {
+    try {
+      const res = await fetch(a.url, { headers: { "User-Agent": NAND_BROWSER_UA } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const { rows, upstream_updated, via } = a.parse(await res.text());
+      if (rows.length >= NAND_WAFER_ITEMS.length) return { rows, upstream_updated, via };
+      throw new Error(`only ${rows.length} wafer rows parsed`);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`  NAND source ${a.label} failed: ${e.message}`);
+    }
+  }
+  throw lastErr;
+}
+
 const HBM_CSV = "hbm_prices.csv";
 /** HBM CSV 列顺序（含 source_label/as_of/unit 用于溯源，flag 用于口径断点标记） */
 export const HBM_FIELDS = [
@@ -491,6 +619,94 @@ function loadHbmRows(dataDir = DATA_DIR) {
   return markBreaks(rows);
 }
 
+// ── NAND CSV 存取（结构同 HBM：合并写 + 断点标记）──
+
+const NAND_CSV = "nand_prices.csv";
+export const NAND_FIELDS = [
+  "date",
+  "source",
+  "item",
+  "capacity_gb",
+  "price_usd",
+  "price_per_gb",
+  "unit",
+  "change_pct",
+  "week_high",
+  "week_low",
+  "upstream_updated",
+  "flag",
+];
+
+const NAND_TEXT_FIELDS = new Set(["date", "source", "item", "unit", "upstream_updated", "flag"]);
+
+function nandFieldValue(r, f) {
+  const v = r[f];
+  if (v === undefined || v === null) return "";
+  return String(v).replace(/[",]/g, (c) => (c === "," ? ";" : ""));
+}
+
+export function loadNandRows(dataDir = DATA_DIR) {
+  const fp = path.join(dataDir, NAND_CSV);
+  if (!fs.existsSync(fp)) return [];
+  const lines = readCsvLines(fp);
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",").map((h) => h.trim());
+  const rows = lines.slice(1).map((line) => {
+    const vals = line.split(",");
+    const obj = {};
+    headers.forEach((h, i) => {
+      const v = vals[i] === undefined ? "" : vals[i];
+      obj[h] = NAND_TEXT_FIELDS.has(h)
+        ? v === ""
+          ? h === "flag"
+            ? null
+            : ""
+          : v
+        : v === ""
+          ? null
+          : parseFloat(v);
+    });
+    if (!obj.flag) obj.flag = null;
+    return obj;
+  });
+  return markBreaks(rows);
+}
+
+export function saveNandCSV(rows, dataDir = DATA_DIR) {
+  const fp = path.join(dataDir, NAND_CSV);
+  fs.mkdirSync(dataDir, { recursive: true });
+  if (rows.length === 0) return { filePath: fp, addedRows: 0 };
+
+  const map = new Map(loadNandRows(dataDir).map((r) => [`${r.date}|${r.item}`, r]));
+  let added = 0;
+  for (const r of rows) {
+    const k = `${r.date}|${r.item}`;
+    const cur = map.get(k);
+    if (!cur) {
+      map.set(k, r);
+      added += 1;
+    } else {
+      // 同一天重复抓取：只补元数据，价格保留首次值
+      for (const f of ["upstream_updated", "unit", "week_high", "week_low"]) {
+        const empty = cur[f] === undefined || cur[f] === null || cur[f] === "";
+        const has = r[f] !== undefined && r[f] !== null && r[f] !== "";
+        if (empty && has) cur[f] = r[f];
+      }
+    }
+  }
+
+  const merged = markBreaks([...map.values()]);
+  merged.sort((a, b) =>
+    a.date === b.date
+      ? String(a.item).localeCompare(String(b.item))
+      : String(a.date).localeCompare(String(b.date))
+  );
+
+  const body = merged.map((r) => NAND_FIELDS.map((f) => nandFieldValue(r, f)).join(",")).join("\n");
+  fs.writeFileSync(fp, NAND_FIELDS.join(",") + "\n" + body + "\n");
+  return { filePath: fp, addedRows: added };
+}
+
 function exportJSON() {
   fs.mkdirSync(DOCS_DIR, { recursive: true });
 
@@ -526,13 +742,18 @@ function exportJSON() {
   fs.writeFileSync(hbmPath, JSON.stringify(hbmRows));
   console.log(`  Exported ${hbmRows.length} HBM rows → ${hbmPath}`);
 
+  const nandRows = loadNandRows();
+  const nandPath = path.join(DOCS_DIR, "nand_prices.json");
+  fs.writeFileSync(nandPath, JSON.stringify(nandRows));
+  console.log(`  Exported ${nandRows.length} NAND rows → ${nandPath}`);
+
   const htmlPath = path.join(DOCS_DIR, "index.html");
-  const html = buildHTML(JSON.stringify(json), JSON.stringify(hbmRows));
+  const html = buildHTML(JSON.stringify(json), JSON.stringify(hbmRows), JSON.stringify(nandRows));
   fs.writeFileSync(htmlPath, html);
   console.log(`  Exported self-contained HTML → ${htmlPath}`);
 }
 
-function buildHTML(jsonLiteral, hbmLiteral = "[]") {
+function buildHTML(jsonLiteral, hbmLiteral = "[]", nandLiteral = "[]") {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -541,7 +762,7 @@ function buildHTML(jsonLiteral, hbmLiteral = "[]") {
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-<title>DDR4/DDR5/HBM 内存价格追踪</title>
+<title>DDR4/DDR5/HBM/NAND 存储价格追踪</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 <style>
   :root { --bg: #f5f6fa; --card: #fff; --text: #2c3e50; --muted: #7f8c8d; }
@@ -568,11 +789,28 @@ function buildHTML(jsonLiteral, hbmLiteral = "[]") {
 <body>
 <div class="container">
   <header>
-    <h1>DDR4 / DDR5 / HBM 内存价格追踪</h1>
-    <p>数据来源：RamRadar（零售价，USD/GB）+ memoryindex.io（HBM 现货/合约价聚合）| 每日自动更新</p>
+    <h1>DDR4 / DDR5 / HBM / NAND 存储价格追踪</h1>
+    <p>数据来源：RamRadar（零售价，USD/GB）+ memoryindex.io（HBM 现货/合约价）+ TrendForce（NAND 晶圆现货价）| 每日自动更新</p>
   </header>
 
   <div class="stats" id="stats"></div>
+
+  <div class="card">
+    <h2>NAND 晶圆现货价（USD / 颗 die）</h2>
+    <div class="stats" id="nand-stats"></div>
+    <p class="note" id="nand-note"></p>
+    <div class="chart" id="nand-bar" style="height:300px"></div>
+  </div>
+
+  <div class="card">
+    <h2>NAND 每 GB 价格走势 (USD/GB)</h2>
+    <div class="chart" id="nand-trend" style="height:340px"></div>
+  </div>
+
+  <div class="card">
+    <h2>NAND 晶圆现货价走势 (USD/颗)</h2>
+    <div class="chart" id="nand-die-trend" style="height:340px"></div>
+  </div>
 
   <div class="card">
     <h2>HBM 价格（USD / stack）</h2>
@@ -610,9 +848,10 @@ function buildHTML(jsonLiteral, hbmLiteral = "[]") {
 <script>
 const DATA = ${jsonLiteral};
 const HBM_DATA = ${hbmLiteral};
+const NAND_DATA = ${nandLiteral};
 
-// 页面显示的最后更新日期 = 两个数据集里最新的日期
-const LAST_UPDATE_DATE = [...new Set([...DATA.map(r => r.date), ...HBM_DATA.map(r => r.date)])].sort().pop() || "-";
+// 页面显示的最后更新日期 = 各数据集里最新的日期
+const LAST_UPDATE_DATE = [...new Set([...DATA.map(r => r.date), ...HBM_DATA.map(r => r.date), ...NAND_DATA.map(r => r.date)])].sort().pop() || "-";
 document.getElementById("last-update").textContent = LAST_UPDATE_DATE;
 
 const HBM_PALETTE = { "HBM3-24G": "#3498db", "HBM3E-36G": "#9b59b6", "HBM4-48G": "#e67e22" };
@@ -775,6 +1014,121 @@ function renderHbm() {
   });
 }
 
+// ── NAND 晶圆现货（TrendForce，USD/颗 die）──
+const NAND_ITEMS = [...new Set(NAND_DATA.map(r => r.item))]
+  .sort((a, b) => (b.capacity_gb || 0) - (a.capacity_gb || 0));
+const NAND_DATES = [...new Set(NAND_DATA.map(r => r.date))].sort();
+const NAND_PALETTE = { "NAND-512Gb-TLC": "#e67e22", "NAND-256Gb-TLC": "#16a085", "NAND-128Gb-TLC": "#8e44ad" };
+const NAND_FALLBACK = ["#e67e22", "#16a085", "#8e44ad", "#2980b9"];
+const nandColor = (it, i) => NAND_PALETTE[it] || NAND_FALLBACK[i % NAND_FALLBACK.length];
+const nandShort = it => it.replace(/^NAND-/, "").replace(/-/g, " ");
+const nandRow = (d, it) => NAND_DATA.find(x => x.date === d && x.item === it) || null;
+const NAND_BREAK_DATES = [...new Set(NAND_DATA.filter(r => r.flag === HBM_BREAK).map(r => r.date))].sort();
+
+function nandLineOption(metric, axisName, suffix) {
+  const series = NAND_ITEMS.map((it, i) => ({
+    name: nandShort(it), type: "line", connectNulls: false, step: "end",
+    symbol: "circle", symbolSize: NAND_DATES.length <= 3 ? 8 : 5,
+    data: NAND_DATES.map(d => {
+      const r = nandRow(d, it);
+      return r && r.flag !== HBM_BREAK ? r[metric] : null;
+    }),
+    lineStyle: { color: nandColor(it, i), width: 2 },
+    itemStyle: { color: nandColor(it, i) },
+    emphasis: { focus: "series" },
+  }));
+
+  if (NAND_BREAK_DATES.length && series.length) {
+    series[0].markLine = {
+      silent: true, symbol: "none",
+      lineStyle: { color: "#e67e22", type: "dashed", width: 1 },
+      label: { formatter: "口径变更", color: "#e67e22", fontSize: 10, position: "insideEndTop" },
+      data: NAND_BREAK_DATES.map(d => ({ xAxis: d })),
+    };
+  }
+
+  const needZoom = NAND_DATES.length > 40;
+  return {
+    tooltip: {
+      trigger: "axis",
+      valueFormatter: (v, p) => {
+        if (v == null) {
+          const r = nandRow(NAND_DATES[p.dataIndex], p.seriesName);
+          return r && r.flag === HBM_BREAK ? "口径变更（不连线）" : "-";
+        }
+        return "$" + Number(v).toFixed(metric === "price_per_gb" ? 3 : 2) + suffix;
+      },
+    },
+    legend: { data: NAND_ITEMS.map(nandShort), bottom: 0 },
+    grid: { left: 70, right: 24, top: 16, bottom: needZoom ? 58 : 34 },
+    xAxis: { type: "category", data: NAND_DATES, boundaryGap: false, axisLabel: { hideOverlap: true } },
+    yAxis: { type: "value", name: axisName, scale: true, axisLabel: { formatter: v => "$" + v } },
+    dataZoom: needZoom
+      ? [{ type: "inside" }, { type: "slider", height: 18, bottom: 24 }]
+      : undefined,
+    series,
+    graphic: NAND_DATES.length === 1
+      ? [{ type: "text", left: "center", top: 40,
+           style: { text: "已有 1 天数据，明日起将连成趋势线", fill: "#7f8c8d", fontSize: 12 } }]
+      : undefined,
+  };
+}
+
+function renderNand() {
+  const el = document.getElementById("nand-stats");
+  if (!NAND_DATA.length) {
+    el.innerHTML = '<div class="stat"><div class="val">-</div><div class="lbl">等待首次 NAND 抓取</div></div>';
+    return;
+  }
+  const latestNandDate = NAND_DATES[NAND_DATES.length - 1];
+  const latestNand = NAND_DATA.filter(r => r.date === latestNandDate)
+    .sort((a, b) => (b.capacity_gb || 0) - (a.capacity_gb || 0));
+
+  el.innerHTML = latestNand.map(r => {
+    const chg = r.change_pct;
+    const chgHtml = (chg == null || Number.isNaN(chg))
+      ? '<span style="color:#7f8c8d">— 无变化数据</span>'
+      : '<span style="color:' + upDownColor(chg) + '">' + upDownArrow(chg) + Math.abs(chg).toFixed(2) + '%</span>';
+    const perGb = r.price_per_gb ? (" · $" + Number(r.price_per_gb).toFixed(3) + "/GB") : "";
+    return '<div class="stat"><div class="val">$' + Number(r.price_usd).toFixed(2) + '</div>' +
+      '<div class="lbl">' + nandShort(r.item) + perGb + '<br>' + chgHtml + '</div></div>';
+  }).join("");
+
+  const note = document.getElementById("nand-note");
+  if (note) {
+    const up = (latestNand.find(r => r.upstream_updated) || {}).upstream_updated || "-";
+    const parts = [
+      "最新收录 " + latestNandDate + "，已累积 " + NAND_DATES.length + " 天（自 " + NAND_DATES[0] + " 起）",
+      "上游最近更新 " + up + "（晶圆现货价通常每周调整，横盘属正常）",
+      "口径：USD/颗 die，按标称容量折算 $/GB（512Gb=64GB、256Gb=32GB、128Gb=16GB）",
+    ];
+    if (NAND_BREAK_DATES.length) {
+      parts.push("⚠ 检测到口径断点：" + NAND_BREAK_DATES.join("、") + "，该点不参与连线");
+    }
+    note.textContent = parts.join(" · ");
+  }
+
+  echarts.init(document.getElementById("nand-trend"))
+    .setOption(nandLineOption("price_per_gb", "USD/GB", "/GB"));
+  echarts.init(document.getElementById("nand-die-trend"))
+    .setOption(nandLineOption("price_usd", "USD/die", "/颗"));
+
+  echarts.init(document.getElementById("nand-bar")).setOption({
+    tooltip: { trigger: "axis", valueFormatter: v => "$" + Number(v).toFixed(2) },
+    grid: { left: 70, right: 20, top: 10, bottom: 34 },
+    xAxis: { type: "category", data: latestNand.map(r => nandShort(r.item)) },
+    yAxis: { type: "value", name: "USD/die", axisLabel: { formatter: v => "$" + v } },
+    series: [{
+      type: "bar", barWidth: "45%",
+      data: latestNand.map((r, i) => ({
+        value: r.price_usd,
+        itemStyle: { color: nandColor(r.item, i) },
+      })),
+      label: { show: true, position: "top", formatter: p => "$" + Number(p.value).toFixed(2) },
+    }],
+  });
+}
+
 if (DATA.length === 0) {
   document.getElementById("stats").innerHTML =
     '<div class="stat"><div class="val">-</div><div class="lbl">等待首次数据抓取</div></div>';
@@ -861,6 +1215,7 @@ if (DATA.length === 0) {
 }
 
 renderHbm();
+renderNand();
 </script>
 </body>
 </html>`;
@@ -940,6 +1295,31 @@ export async function main() {
     }
   } catch (e) {
     console.warn(`  HBM fetch failed (non-fatal): ${e.message}`);
+  }
+
+  console.log("\n── NAND wafer spot (TrendForce) ──");
+  try {
+    const { rows: nand, upstream_updated, via } = await withRetries(() => fetchNand(), {
+      attempts: 2,
+      delayMs: 2_000,
+      label: "NAND fetch",
+    });
+    console.log(`  Via ${via}, upstream updated: ${upstream_updated || "-"}`);
+    if (nand.length > 0) {
+      const savedNand = saveNandCSV(nand.map((r) => ({ date: TODAY, source: via, ...r })));
+      console.log(
+        `  NAND items: ${nand
+          .map((r) => `${r.item} $${r.price_usd} ($${r.price_per_gb}/GB)`)
+          .join("; ")}`
+      );
+      console.log(
+        savedNand.addedRows > 0
+          ? `  Saved ${savedNand.addedRows} new NAND rows → ${savedNand.filePath}`
+          : `  No new NAND rows → ${savedNand.filePath}`
+      );
+    }
+  } catch (e) {
+    console.warn(`  NAND fetch failed (non-fatal): ${e.message}`);
   }
 
   console.log("\n── export JSON + HTML ──");

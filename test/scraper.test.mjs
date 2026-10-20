@@ -9,6 +9,10 @@ import {
   withRetries,
   parseCsv,
   buildDailyRows,
+  parseTrendforceWafer,
+  parseDramexchangeWafer,
+  saveNandCSV,
+  loadNandRows,
 } from "../scraper.mjs";
 
 test("parseCsv maps header to object keys", () => {
@@ -95,4 +99,80 @@ test("saveCSV reports how many rows were actually appended", () => {
 
   const lines = fs.readFileSync(path.join(tempDir, "prices.csv"), "utf-8").trim().split("\n");
   assert.equal(lines.length, 4);
+});
+
+// ── NAND wafer spot ──
+
+function waferRow(item, nums, trend) {
+  return (
+    `<tr><td style="width:auto"><span data-toggle="tooltip">${item}</span></td>` +
+    nums.map((n) => `<td class="lcd-num-l">${n}</td>`).join("") +
+    `<td class="percent-cell"><span class="${trend}">0.00 %</span></td></tr>`
+  );
+}
+
+test("parseTrendforceWafer converts USD/die to USD/GB and keeps upstream date", () => {
+  const html =
+    '<div class="price-block"><h2>Wafer Spot Price</h2>' +
+    "<p>Last Update 2026-10-12 14:40 (GMT+8)</p>" +
+    '<table class="price-table"><tbody>' +
+    "<tr><td>Item</td><td>Weekly High</td></tr>" +
+    waferRow("512Gb TLC", ["21.00", "16.80", "21.00", "16.80", "18.833"], "flat-trend") +
+    waferRow("256Gb TLC", ["20.00", "16.80", "20.00", "16.80", "18.365"], "up-trend") +
+    waferRow("128Gb TLC", ["15.00", "8.00", "15.00", "8.00", "9.967"], "down-trend") +
+    "</tbody></table></div>";
+
+  const { rows, upstream_updated, via } = parseTrendforceWafer(html);
+  assert.equal(via, "trendforce");
+  assert.equal(upstream_updated, "2026-10-12 14:40");
+  assert.equal(rows.length, 3);
+
+  const big = rows.find((r) => r.item === "NAND-512Gb-TLC");
+  assert.equal(big.capacity_gb, 64);
+  assert.equal(big.price_usd, 18.833);
+  assert.equal(big.price_per_gb, 0.29);
+  assert.equal(big.unit, "USD / die");
+  assert.equal(big.change_dir, "flat");
+
+  assert.equal(rows.find((r) => r.item === "NAND-256Gb-TLC").price_per_gb, 0.57);
+  assert.equal(rows.find((r) => r.item === "NAND-128Gb-TLC").change_dir, "down");
+});
+
+test("parseDramexchangeWafer works as fallback with its own markup", () => {
+  const html =
+    '<div class="tab_title">Wafer Spot Price Last Update:Oct.12 2026 14:40 (GMT+8)</div>' +
+    "<table><tbody><tr>" +
+    '<td class="tab_tr_gray2"><a href="/Price/Wafer_Spot">512Gb TLC</a></td>' +
+    '<td class="tab_tr_gray">21.00</td><td class="tab_tr_gray">16.80</td>' +
+    '<td class="tab_tr_gray">21.00</td><td class="tab_tr_gray">16.80</td>' +
+    '<td class="tab_tr_gray">18.833</td>' +
+    '<td class="tab_tr_font9"><img src="stable.gif"><br> 0.00 %</td>' +
+    "</tr></tbody></table>";
+
+  const { rows, via } = parseDramexchangeWafer(html);
+  assert.equal(via, "dramexchange");
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].item, "NAND-512Gb-TLC");
+  assert.equal(rows[0].price_usd, 18.833);
+});
+
+test("saveNandCSV dedupes by date+item and preserves history", () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nand-scraper-"));
+  const day1 = [
+    { date: "2026-10-19", source: "trendforce", item: "NAND-512Gb-TLC", capacity_gb: 64, price_usd: 18.833, price_per_gb: 0.29, unit: "USD / die", change_pct: 0, upstream_updated: "2026-10-12 14:40" },
+  ];
+  const first = saveNandCSV(day1, tempDir);
+  const second = saveNandCSV(
+    [...day1, { ...day1[0], date: "2026-10-20" }],
+    tempDir
+  );
+
+  assert.equal(first.addedRows, 1);
+  assert.equal(second.addedRows, 1);
+
+  const rows = loadNandRows(tempDir);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].price_usd, 18.833);
+  assert.equal(rows[0].upstream_updated, "2026-10-12 14:40");
+  assert.equal(rows[1].date, "2026-10-20");
 });

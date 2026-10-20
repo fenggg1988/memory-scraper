@@ -36,7 +36,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/ram_prices.csv data/hbm_prices.csv docs/ || true
+          git add data/ram_prices.csv data/hbm_prices.csv data/nand_prices.csv docs/ || true
           if git diff --cached --quiet; then
             echo "No data changes to commit"
           else
