@@ -17,3 +17,6 @@ date,source,item,capacity_gb,price_usd,price_per_gb,unit,change_pct,week_high,we
 2026-10-25,trendforce,NAND-128Gb-TLC,16,9.967,0.62,USD / die,0,15,8,2026-10-12 14:40,
 2026-10-25,trendforce,NAND-256Gb-TLC,32,18.365,0.57,USD / die,0,20,16.8,2026-10-12 14:40,
 2026-10-25,trendforce,NAND-512Gb-TLC,64,18.833,0.29,USD / die,0,21,16.8,2026-10-12 14:40,
+2026-10-26,trendforce,NAND-128Gb-TLC,16,9.967,0.62,USD / die,0,15,8,2026-10-12 14:40,
+2026-10-26,trendforce,NAND-256Gb-TLC,32,18.365,0.57,USD / die,0,20,16.8,2026-10-12 14:40,
+2026-10-26,trendforce,NAND-512Gb-TLC,64,18.833,0.29,USD / die,0,21,16.8,2026-10-12 14:40,
